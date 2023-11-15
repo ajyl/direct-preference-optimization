@@ -82,11 +82,13 @@ activation_checkpointing: false
 
 # evaluate and save model every eval_every steps
 eval_every: 100
+save_every: 9999
 
 # prevent wandb from logging more than once per minimum_log_interval_secs
 minimum_log_interval_secs: 1.0
 
 defaults:
 - _self_
-- model: blank_model_fp32 # basic model configuration
+- model: gpt2
 - loss: dpo # which loss function, either sft or dpo (specify loss.beta if using dpo)
+

@@ -82,7 +82,7 @@ def main(config: DictConfig):
     Validates config, creates/initializes model(s),
     and kicks off worker process(es).
     """
-
+    #config.model = "gpt2-medium"
     # Resolve hydra references, e.g. so we don't re-compute the run directory
     OmegaConf.resolve(config)
 
