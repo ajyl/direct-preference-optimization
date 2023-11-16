@@ -287,60 +287,63 @@ def generate(
     Return greedy and n-gram blocked generations.
     """
     prompt_shape = batch["prompt_input_ids"].shape[1]
-    # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
-    ctx = lambda: (
-        FSDP.summon_full_params(model, writeback=False, recurse=False)
-        if fsdp
-        else contextlib.nullcontext()
-    )
-    with ctx():
-        greedy_resp = model.generate(
-            input_ids=batch["prompt_input_ids"],
-            attention_mask=batch["prompt_attention_mask"],
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-        )
-
-    greedy_resp_labels = greedy_resp.detach().clone()
-    greedy_resp_labels[:, :prompt_shape] = -100
-    output = {
-        "neg_input_ids": greedy_resp,
-        "neg_attention_mask": greedy_resp != GPT2_PAD_IDX,
-        "neg_labels": greedy_resp_labels,
-    }
-
-    if include_ngram_blocked:
-        with ctx():
-            ngram_blocked_resp = model.generate(
-                input_ids=batch["prompt_input_ids"],
-                attention_mask=batch["prompt_attention_mask"],
-                max_new_tokens=max_new_tokens,
-                no_repeat_ngram_size=1,
-                pad_token_id=pad_token_id,
-            )
-
-        ngram_blocked_labels = ngram_blocked_resp.detach().clone()
-        ngram_blocked_labels[:, :prompt_shape] = -100
-        output["pos_input_ids"] = ngram_blocked_resp
-        output["pos_attention_mask"] = ngram_blocked_resp != GPT2_PAD_IDX
-        output["pos_labels"] = ngram_blocked_labels
-
-    if include_ref and ref_model is not None:
+    with torch.no_grad():
+        # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
         ctx = lambda: (
-            FSDP.summon_full_params(ref_model, writeback=False, recurse=False)
+            FSDP.summon_full_params(model, writeback=False, recurse=False)
             if fsdp
             else contextlib.nullcontext()
         )
         with ctx():
-            ref_out = ref_model.generate(
+            greedy_resp = model.generate(
                 input_ids=batch["prompt_input_ids"],
                 attention_mask=batch["prompt_attention_mask"],
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=pad_token_id,
             )
-            output["ref_input_ids"] = ref_out
+
+        greedy_resp_labels = greedy_resp.detach().clone()
+        greedy_resp_labels[:, :prompt_shape] = -100
+        output = {
+            "neg_input_ids": greedy_resp,
+            "neg_attention_mask": greedy_resp != GPT2_PAD_IDX,
+            "neg_labels": greedy_resp_labels,
+        }
+
+        if include_ngram_blocked:
+            with ctx():
+                ngram_blocked_resp = model.generate(
+                    input_ids=batch["prompt_input_ids"],
+                    attention_mask=batch["prompt_attention_mask"],
+                    max_new_tokens=max_new_tokens,
+                    no_repeat_ngram_size=1,
+                    pad_token_id=pad_token_id,
+                )
+
+            ngram_blocked_labels = ngram_blocked_resp.detach().clone()
+            ngram_blocked_labels[:, :prompt_shape] = -100
+            output["pos_input_ids"] = ngram_blocked_resp
+            output["pos_attention_mask"] = ngram_blocked_resp != GPT2_PAD_IDX
+            output["pos_labels"] = ngram_blocked_labels
+
+        if include_ref and ref_model is not None:
+            ctx = lambda: (
+                FSDP.summon_full_params(
+                    ref_model, writeback=False, recurse=False
+                )
+                if fsdp
+                else contextlib.nullcontext()
+            )
+            with ctx():
+                ref_out = ref_model.generate(
+                    input_ids=batch["prompt_input_ids"],
+                    attention_mask=batch["prompt_attention_mask"],
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=pad_token_id,
+                )
+                output["ref_input_ids"] = ref_out
 
     return output
 
@@ -660,7 +663,6 @@ class BasicTrainer(object):
             metrics[f"policy_recall_{train_test}/negative"] = policy_recalls
             metrics[f"policy_f1_{train_test}/negative"] = policy_f1s
 
-
             if "ref_input_ids" in batch:
                 ref_precs = []
                 ref_recalls = []
@@ -671,15 +673,15 @@ class BasicTrainer(object):
 
                     _ref = batch["ref_input_ids"][batch_idx]
                     _ref = _ref[_ref != GPT2_PAD_IDX].unique()
-                    ref_prec, ref_recall, ref_f1 = get_prec_recall_f1(_ref, _gold)
-                    ref_precs.append(neg_prec)
-                    ref_recalls.append(neg_recall)
-                    ref_f1s.append(neg_f1)
+                    ref_prec, ref_recall, ref_f1 = get_prec_recall_f1(
+                        _ref, _gold
+                    )
+                    ref_precs.append(ref_prec)
+                    ref_recalls.append(ref_recall)
+                    ref_f1s.append(ref_f1)
                 metrics[f"ref_precision_{train_test}/negative"] = ref_precs
                 metrics[f"ref_recall_{train_test}/negative"] = ref_recalls
                 metrics[f"ref_f1_{train_test}/negative"] = ref_f1s
-
-
 
         elif loss_config.name == "sft":
             policy_pos_logits = self.policy(
@@ -729,15 +731,15 @@ class BasicTrainer(object):
         random.seed(self.seed)
 
         if self.config.loss.name == "dpo":
-            result = self.reference_model.eval()
-            if result == -1:
-                return
+            self.reference_model.eval()
 
         for batch in self.train_iterator:
             if self.example_counter % self.config.eval_every == 0 and (
                 self.example_counter > 0 or self.config.do_first_eval
             ):
-                self.eval()
+                result = self.eval()
+                if result == -1:
+                    break
 
             self.train(batch)
 
