@@ -71,7 +71,7 @@ def worker_main(
         world_size=world_size,
     )
 
-    trainer.train()
+    trainer.train_loop()
     trainer.save()
 
 
@@ -155,6 +155,7 @@ def main(config: DictConfig):
         policy.load_state_dict(state_dict["state"])
         if config.loss.name == "dpo":
             reference_model.load_state_dict(state_dict["state"])
+
         print("loaded pre-trained weights")
 
     if "FSDP" in config.trainer:

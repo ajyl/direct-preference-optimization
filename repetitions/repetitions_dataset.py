@@ -4,11 +4,13 @@ Load Repetitions pairwise data.
 from typing import Dict, List, Optional, Iterator, Callable, Union, Tuple
 
 import os
+import json
 from collections import defaultdict
 import random
-import tqdm
+from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
 from dpo_utils import get_local_dir, TemporarilySeededRandom
@@ -32,7 +34,7 @@ def load_data(valid_size):
     return train, valid
 
 
-def load_wiki103(data_type = None):
+def load_wiki103(data_type=None):
     """
     Load Wiki103.
     """
@@ -69,11 +71,15 @@ def load_wiki103(data_type = None):
 
 
 def get_repetitions_batch_iterator(
+    model: nn.Module,
+    tokenizer,
     split: str = "train",
     batch_size: int = 1,
     n_epochs: int = 1,
     max_prompt_length: int = 128,
+    max_new_tokens: int = 64,
     valid_size: int = 128,
+    device: str = "cuda",
 ) -> Iterator[Dict]:
     """
     Get an iterator over batches of data.
@@ -86,58 +92,48 @@ def get_repetitions_batch_iterator(
     :valid_size: Validation size.
     """
     assert split in ["train", "valid"]
-    response_dir = os.path.join(DATA_DIR, "repetitions/wiki103_outputs")
-
-    task_number = 98
-    prompt_file = os.path.join(response_dir, f"_prompts_{task_number}.pt")
-    greedy_file = os.path.join(
-        response_dir, f"_greedy_generations_{task_number}.pt"
-    )
-    ngram_blocked_file = os.path.join(
-        response_dir, f"_ngram_blocked_generations_{task_number}.pt"
+    data_dir = os.path.join(
+        DATA_DIR, "repetitions/wiki103_splices_w_next_sents"
     )
 
-    prompts = torch.load(prompt_file).to("cpu")
-    greedy = torch.load(greedy_file).to("cpu")
-    ngram_blocked = torch.load(ngram_blocked_file).to("cpu")
+    filenames = [
+        os.path.join(data_dir, filename)
+        for filename in os.listdir(data_dir)
+        if filename.endswith(".jsonl")
+    ]
+    if split == "train":
+        filenames = filenames[:-1]
+    else:
+        filenames = [filenames[-1]]
 
-    assert prompts.shape == greedy.shape
-    assert greedy.shape == ngram_blocked.shape
-    data_size = prompts.shape[0]
-    seq_len = prompts.shape[1]
-
-    breakpoint()
+    random.shuffle(filenames)
     for _ in range(n_epochs):
-        for idx in range(0, data_size, batch_size):
-            idxs = torch.arange(idx, idx + batch_size)
-            batch = data[idxs]
+        for filename in tqdm(filenames):
+            with open(filename, "r") as file_p:
+                file_data = file_p.readlines()
 
-            prompt_ids = batch[:, 0, :]
-            _pos_ids = batch[:, 1, :]
-            _neg_ids = batch[:, 2, :]
+            random.shuffle(file_data)
+            data_size = len(file_data)
+            if split == "valid":
+                data_size = valid_size
+            for idx in range(0, data_size, batch_size):
+                data = file_data[idx : idx + batch_size]
+                data = [json.loads(x.strip()) for x in data]
 
-            pos_ids = torch.concat([prompt_ids, _pos_ids], dim=1)
-            neg_ids = torch.concat([prompt_ids, _neg_ids], dim=1)
+                prompt = [x[0] for x in data]
+                gold = [x[1] for x in data]
 
-            pos_labels = torch.concat([
-                torch.ones_like(prompt_ids) * -100,
-                _pos_ids
-            ], dim=1)
-            neg_labels = torch.concat([
-                torch.ones_like(prompt_ids) * -100,
-                _neg_ids
-            ], dim=1)
-            breakpoint()
+                prompt_tokenized = tokenizer(
+                    prompt,
+                    max_length=max_prompt_length,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                ).to(device)
+                prompt_input_ids = prompt_tokenized["input_ids"]
+                prompt_attention_mask = prompt_tokenized["attention_mask"]
 
-            yield {
-                "prompt_input_ids": prompt_ids,
-                "prompt_attention_mask": prompt_ids != GPT2_PAD_IDX,
-
-                "pos_input_ids": pos_ids,
-                "pos_attention_mask": pos_ids != GPT2_PAD_IDX,
-                "pos_labels": pos_labels,
-
-                "neg_input_ids": neg_ids,
-                "neg_attention_mask": neg_ids != GPT2_PAD_IDX,
-                "neg_labels": neg_labels,
-            }
+                yield {
+                    "prompt_input_ids": prompt_input_ids,
+                    "prompt_attention_mask": prompt_attention_mask,
+                }

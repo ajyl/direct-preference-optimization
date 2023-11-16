@@ -18,7 +18,7 @@ fsdp_port: null
 
 # wandb configuration
 wandb:
-  enabled: false
+  enabled: true
   entity: null
   project: "direct-preference-optimization"
 
@@ -33,7 +33,7 @@ local_dirs:
 sample_during_eval: true
 
 # how many model samples to generate during evaluation
-n_eval_model_samples: 8
+n_eval_model_samples: 16
 
 # whether to eval at the very beginning of training
 do_first_eval: true
@@ -43,7 +43,7 @@ local_run_dir: ${get_local_run_dir:${exp_name},${local_dirs}}
 
 # the learning rate
 # Try 1e-5
-lr: 5e-7
+lr: 1e-5
 
 # number of steps to accumulate over for each batch
 #   (e.g. if batch_size=4 and gradient_accumulation_steps=2, then we will
@@ -55,18 +55,13 @@ max_grad_norm: 10.0
 
 # the maximum allowed length for an input (prompt + response)
 max_length: 128
+max_new_tokens: 64
 
 # the maximum allowed length for a prompt
 max_prompt_length: 64
 
 # the number of epochs to train for; if null, must specify n_examples
 n_epochs: 1
-
-# the number of examples to train for; if null, must specify n_epochs
-n_examples: null
-
-# the number of examples to evaluate on (and sample from, if sample_during_eval is true)
-n_eval_examples: 128
 
 # the trainer class to use (e.g. BasicTrainer, FSDPTrainer, TensorParallelTrainer)
 trainer: BasicTrainer

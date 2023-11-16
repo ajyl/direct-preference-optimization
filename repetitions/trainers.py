@@ -18,6 +18,7 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+from torch.nn import KLDivLoss
 import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -45,8 +46,60 @@ from dpo_utils import (
     rank0_print,
     get_local_dir,
 )
+from dpo_constants import GPT2_PAD_IDX
 
 torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def get_repetitions(
+    context,
+    response,
+    ngram_size,
+    ignore_idx=GPT2_PAD_IDX,
+    scheme="token_level",
+    include_context=False,
+):
+    """
+    Build repetition labels.
+    """
+    assert scheme in ["token_level", "first_occur", "sequence_level"]
+    if isinstance(context, list):
+        context = torch.tensor(context)
+    if isinstance(response, list):
+        response = torch.tensor(response)
+
+    assert context.shape[0] == response.shape[0]
+
+    repetitions = torch.zeros_like(response)
+    for batch_idx in range(response.shape[0]):
+        curr_context = context[batch_idx]
+        curr_resp = response[batch_idx]
+
+        for seq_idx in range(ngram_size - 1, response.shape[1]):
+            ngram = curr_resp[seq_idx - ngram_size + 1 : seq_idx + 1].tolist()
+            if include_context:
+                prev_context = (
+                    curr_context.tolist() + curr_resp[:seq_idx].tolist()
+                )
+            else:
+                prev_context = curr_resp[:seq_idx].tolist()
+
+            ngram_str = " " + " ".join([str(x) for x in ngram]) + " "
+            context_str = " " + " ".join([str(x) for x in prev_context]) + " "
+            if ngram_str in context_str:
+                if scheme == "first_occur":
+                    repetitions[batch_idx, seq_idx:] = 1
+                    break
+                elif scheme == "sequence_level":
+                    if GPT2_PAD_IDX in ngram_str:
+                        continue
+                    repetitions[batch_idx] = 1
+                    break
+
+                repetitions[batch_idx, seq_idx] = 1
+
+    repetitions[response.eq(ignore_idx)] = -1
+    return repetitions
 
 
 def dpo_loss(
@@ -174,6 +227,59 @@ def concatenated_inputs(
     return concatenated_batch
 
 
+def generate(
+    model,
+    batch,
+    max_new_tokens,
+    pad_token_id,
+    greedy_only=False,
+    fsdp=False,
+):
+    """
+    Return greedy and n-gram blocked generations.
+    """
+    prompt_shape = batch["prompt_input_ids"].shape[1]
+    # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
+    ctx = lambda: (
+        FSDP.summon_full_params(model, writeback=False, recurse=False)
+        if fsdp
+        else contextlib.nullcontext()
+    )
+    with ctx():
+        greedy_resp = model.generate(
+            input_ids=batch["prompt_input_ids"],
+            attention_mask=batch["prompt_attention_mask"],
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_token_id,
+        )
+
+    greedy_resp_labels = greedy_resp.detach().clone()
+    greedy_resp_labels[:, :prompt_shape] = -100
+    output = {
+        "neg_input_ids": greedy_resp,
+        "neg_attention_mask": greedy_resp != GPT2_PAD_IDX,
+        "neg_labels": greedy_resp_labels,
+    }
+
+    if not greedy_only:
+        with ctx():
+            ngram_blocked_resp = model.generate(
+                input_ids=batch["prompt_input_ids"],
+                attention_mask=batch["prompt_attention_mask"],
+                max_new_tokens=max_new_tokens,
+                no_repeat_ngram_size=1,
+                pad_token_id=pad_token_id,
+            )
+
+        ngram_blocked_labels = ngram_blocked_resp.detach().clone()
+        ngram_blocked_labels[:, :prompt_shape] = -100
+        output["pos_input_ids"] = ngram_blocked_resp
+        output["pos_attention_mask"] = ngram_blocked_resp != GPT2_PAD_IDX
+        output["pos_labels"] = ngram_blocked_labels
+    return output
+
+
 class BasicTrainer(object):
     def __init__(
         self,
@@ -196,6 +302,9 @@ class BasicTrainer(object):
         self.world_size = world_size
         self.config = config
         self.run_dir = run_dir
+        self.example_counter = 0
+        self.batch_counter = 0
+        self.last_log = None
 
         tokenizer_name_or_path = (
             config.model.tokenizer_name_or_path or config.model.name_or_path
@@ -204,24 +313,36 @@ class BasicTrainer(object):
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             tokenizer_name_or_path, cache_dir=get_local_dir(config.local_dirs)
         )
+        self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.policy = policy
         self.reference_model = reference_model
+        self.kl_criterion = KLDivLoss(reduction="none", log_target=True)
 
         self.train_iterator = get_repetitions_batch_iterator(
+            self.policy,
+            self.tokenizer,
             split="train",
             n_epochs=config.n_epochs,
             batch_size=config.batch_size,
+            max_prompt_length=config.max_prompt_length,
+            max_new_tokens=config.max_new_tokens,
             valid_size=config.valid_size,
+            device="cuda",
         )
         rank0_print(f"Loaded train data iterator")
         self.eval_iterator = get_repetitions_batch_iterator(
+            self.policy,
+            self.tokenizer,
             split="valid",
             n_epochs=config.n_epochs,
             batch_size=config.batch_size,
+            max_prompt_length=config.max_prompt_length,
+            max_new_tokens=config.max_new_tokens,
             valid_size=config.valid_size,
+            device="cuda",
         )
         self.eval_batches = list(self.eval_iterator)
         rank0_print(
@@ -304,8 +425,16 @@ class BasicTrainer(object):
         concatenating the positive and negative inputs together.
 
         We do this to avoid doing two forward passes, because it's faster for FSDP.
+
+        :returns:
+        :pos_logps: (batch)
+        :neg_logps: (batch)
+        :pos_logits: (batch, seq, vocab)
+        :neg_logits: (batch, seq, vocab)
         """
         concatenated_batch = concatenated_inputs(batch)
+
+        # [batch (*2), seq (prompt + response), vocab]
         all_logits = model(
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
@@ -315,10 +444,13 @@ class BasicTrainer(object):
             concatenated_batch["concatenated_labels"],
             average_log_prob=False,
         )
-        pos_logps = all_logps[: batch["pos_input_ids"].shape[0]]
-        neg_logps = all_logps[batch["pos_input_ids"].shape[0] :]
-        breakpoint()
-        return pos_logps, neg_logps
+
+        num_pos_samples = batch["pos_input_ids"].shape[0]
+        pos_logps = all_logps[:num_pos_samples]
+        neg_logps = all_logps[num_pos_samples:]
+        pos_logits = all_logits[:num_pos_samples]
+        neg_logits = all_logits[num_pos_samples:]
+        return pos_logps, neg_logps, pos_logits, neg_logits
 
     def get_batch_metrics(
         self,
@@ -332,27 +464,30 @@ class BasicTrainer(object):
 
         metrics = {}
         train_test = "train" if train else "valid"
+        prompt_shape = batch["prompt_input_ids"].shape[1]
 
         if loss_config.name == "dpo":
             (
                 policy_pos_logps,
                 policy_neg_logps,
+                policy_pos_logits,
+                policy_neg_logits,
             ) = self.concatenated_forward(self.policy, batch)
             with torch.no_grad():
                 (
-                    reference_pos_logps,
-                    reference_neg_logps,
+                    ref_pos_logps,
+                    ref_neg_logps,
+                    ref_pos_logits,
+                    ref_neg_logits,
                 ) = self.concatenated_forward(self.reference_model, batch)
-
             losses, pos_rewards, neg_rewards = dpo_loss(
                 policy_pos_logps,
                 policy_neg_logps,
-                reference_pos_logps,
-                reference_neg_logps,
+                ref_pos_logps,
+                ref_neg_logps,
                 beta=loss_config.beta,
                 reference_free=loss_config.reference_free,
             )
-            breakpoint()
             reward_accuracies = (pos_rewards > neg_rewards).float()
 
             pos_rewards = all_gather_if_needed(
@@ -385,6 +520,49 @@ class BasicTrainer(object):
                 policy_neg_logps.cpu().numpy().tolist()
             )
 
+            # [batch, seq]
+            kl_div_pos = self.kl_criterion(
+                F.log_softmax(policy_pos_logits, dim=-1),
+                F.log_softmax(ref_pos_logits, dim=-1),
+            ).sum(dim=-1)
+            metrics[f"kl_div_{train_test}/positive"] = (
+                kl_div_pos.mean(dim=-1).detach().cpu().numpy().tolist()
+            )
+
+            kl_div_neg = self.kl_criterion(
+                F.log_softmax(policy_neg_logits, dim=-1),
+                F.log_softmax(ref_neg_logits, dim=-1),
+            ).sum(dim=-1)
+            metrics[f"kl_div_{train_test}/negative"] = (
+                kl_div_neg.mean(dim=-1).detach().cpu().numpy().tolist()
+            )
+
+            repetitions_pos = get_repetitions(
+                batch["prompt_input_ids"],
+                batch["pos_input_ids"][:, prompt_shape:],
+                1,
+            )
+            repetitions_neg = get_repetitions(
+                batch["prompt_input_ids"],
+                batch["neg_input_ids"][:, prompt_shape:],
+                1,
+            )
+            pos_repetition_metric = (repetitions_pos == 0).sum(1) / (
+                repetitions_pos != -1
+            ).sum(1)
+            neg_repetition_metric = (repetitions_neg == 0).sum(1) / (
+                repetitions_neg != -1
+            ).sum(1)
+
+            metrics[f"repetitions_{train_test}/positive"] = (
+                pos_repetition_metric.cpu().numpy().tolist()
+            )
+            metrics[f"repetitions_{train_test}/negative"] = (
+                neg_repetition_metric.cpu().numpy().tolist()
+            )
+
+
+
         elif loss_config.name == "sft":
             policy_pos_logits = self.policy(
                 batch["pos_input_ids"],
@@ -414,7 +592,7 @@ class BasicTrainer(object):
 
         return losses.mean(), metrics
 
-    def train(self):
+    def train_loop(self):
         """Begin either SFT or DPO training, with periodic evaluation."""
 
         rank0_print(f"Using {self.config.optimizer} optimizer")
@@ -435,89 +613,97 @@ class BasicTrainer(object):
         if self.config.loss.name == "dpo":
             self.reference_model.eval()
 
-        self.example_counter = 0
-        self.batch_counter = 0
-        last_log = None
-
         for batch in self.train_iterator:
             if self.example_counter % self.config.eval_every == 0 and (
                 self.example_counter > 0 or self.config.do_first_eval
             ):
                 self.eval()
 
-            #### BEGIN TRAINING ####
+            self.train(batch)
+
+    def train(self, batch):
+        """
+        Run single train step.
+        """
+        self.policy.train()
+
+        start_time = time.time()
+        batch_metrics = defaultdict(list)
+        for microbatch_idx in range(self.config.gradient_accumulation_steps):
+            # batch:
+            # {
+            #   "prompt": List[str],
+            #   "chosen": List[str],
+            #   "rejected": List[str],
+            #   "chosen_response_only": List[str],
+            #   "rejected_response_only": List[str],
+            #   "chosen_input_ids": Tensor[batch, prompt+resp],
+            #   "chosen_attention_mask": Tensor[batch, prompt+resp],
+            #   "chosen_labels": Tensor[batch, prompt+resp],
+            #   "rejected_input_ids": Tensor[batch, prompt+resp],
+            #   "rejected_attention_mask": Tensor[batch, prompt+resp],
+            #   "rejected_labels": Tensor[batch, prompt+resp],
+            #   "prompt_input_ids": Tensor[batch, prompt],
+            #   "prompt_attention_mask": Tensor[batch, prompt],
+            # }
+            generations = generate(
+                self.policy,
+                batch,
+                self.config.max_new_tokens,
+                self.tokenizer.pad_token_id,
+                greedy_only=False,
+                fsdp="FSDP" in self.config.trainer,
+            )
+            batch.update(generations)
             self.policy.train()
+            global_microbatch = slice_and_move_batch_for_device(
+                batch,
+                microbatch_idx,
+                self.config.gradient_accumulation_steps,
+                self.rank,
+            )
+            local_microbatch = slice_and_move_batch_for_device(
+                global_microbatch, self.rank, self.world_size, self.rank
+            )
+            loss, metrics = self.get_batch_metrics(
+                local_microbatch, self.config.loss, train=True
+            )
+            (loss / self.config.gradient_accumulation_steps).backward()
 
-            start_time = time.time()
-            batch_metrics = defaultdict(list)
-            for microbatch_idx in range(
-                self.config.gradient_accumulation_steps
-            ):
-                # batch:
-                # {
-                #   "prompt": List[str],
-                #   "chosen": List[str],
-                #   "rejected": List[str],
-                #   "chosen_response_only": List[str],
-                #   "rejected_response_only": List[str],
-                #   "chosen_input_ids": Tensor[batch, prompt+resp],
-                #   "chosen_attention_mask": Tensor[batch, prompt+resp],
-                #   "chosen_labels": Tensor[batch, prompt+resp],
-                #   "rejected_input_ids": Tensor[batch, prompt+resp],
-                #   "rejected_attention_mask": Tensor[batch, prompt+resp],
-                #   "rejected_labels": Tensor[batch, prompt+resp],
-                #   "prompt_input_ids": Tensor[batch, prompt],
-                #   "prompt_attention_mask": Tensor[batch, prompt],
-                # }
-                global_microbatch = slice_and_move_batch_for_device(
-                    batch,
-                    microbatch_idx,
-                    self.config.gradient_accumulation_steps,
-                    self.rank,
-                )
-                local_microbatch = slice_and_move_batch_for_device(
-                    global_microbatch, self.rank, self.world_size, self.rank
-                )
-                loss, metrics = self.get_batch_metrics(
-                    local_microbatch, self.config.loss, train=True
-                )
-                (loss / self.config.gradient_accumulation_steps).backward()
+            for k, v in metrics.items():
+                batch_metrics[k].extend(v)
 
-                for k, v in metrics.items():
-                    batch_metrics[k].extend(v)
+        grad_norm = self.clip_gradient()
+        self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
 
-            grad_norm = self.clip_gradient()
-            self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad()
+        step_time = time.time() - start_time
+        examples_per_second = self.config.batch_size / step_time
+        batch_metrics["examples_per_second"].append(examples_per_second)
+        batch_metrics["grad_norm"].append(grad_norm)
 
-            step_time = time.time() - start_time
-            examples_per_second = self.config.batch_size / step_time
-            batch_metrics["examples_per_second"].append(examples_per_second)
-            batch_metrics["grad_norm"].append(grad_norm)
+        self.batch_counter += 1
+        self.example_counter += self.config.batch_size
 
-            self.batch_counter += 1
-            self.example_counter += self.config.batch_size
+        if (
+            self.last_log is None
+            or time.time() - self.last_log
+            > self.config.minimum_log_interval_secs
+        ):
+            mean_train_metrics = {
+                k: sum(v) / len(v) for k, v in batch_metrics.items()
+            }
+            mean_train_metrics["counters/examples"] = self.example_counter
+            mean_train_metrics["counters/updates"] = self.batch_counter
+            rank0_print(
+                f"train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}"
+            )
 
-            if (
-                last_log is None
-                or time.time() - last_log
-                > self.config.minimum_log_interval_secs
-            ):
-                mean_train_metrics = {
-                    k: sum(v) / len(v) for k, v in batch_metrics.items()
-                }
-                mean_train_metrics["counters/examples"] = self.example_counter
-                mean_train_metrics["counters/updates"] = self.batch_counter
-                rank0_print(
-                    f"train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}"
-                )
+            if self.config.wandb.enabled and self.rank == 0:
+                wandb.log(mean_train_metrics, step=self.example_counter)
 
-                if self.config.wandb.enabled and self.rank == 0:
-                    wandb.log(mean_train_metrics, step=self.example_counter)
-
-                last_log = time.time()
-            #### END TRAINING ####
+            self.last_log = time.time()
 
     def eval(self):
         """
@@ -531,19 +717,29 @@ class BasicTrainer(object):
         all_eval_metrics = defaultdict(list)
         if self.config.sample_during_eval:
             all_policy_samples, all_reference_samples = [], []
-            # policy_text_table = wandb.Table(
-            #    columns=["step", "prompt", "sample"]
-            # )
-            # if self.config.loss.name == "dpo":
-            #    reference_text_table = wandb.Table(
-            #        columns=["step", "prompt", "sample"]
-            #    )
+            policy_text_table = wandb.Table(
+               columns=["step", "sample"]
+            )
+            if self.config.loss.name == "dpo":
+               reference_text_table = wandb.Table(
+                   columns=["step", "sample"]
+               )
 
         for eval_batch in (
             tqdm(self.eval_batches, desc="Computing eval metrics")
             if self.rank == 0
             else self.eval_batches
         ):
+
+            generations = generate(
+                self.policy,
+                eval_batch,
+                self.config.max_new_tokens,
+                self.tokenizer.pad_token_id,
+                greedy_only=False,
+                fsdp="FSDP" in self.config.trainer,
+            )
+            eval_batch.update(generations)
             local_eval_batch = slice_and_move_batch_for_device(
                 eval_batch, self.rank, self.world_size, self.rank
             )
@@ -585,19 +781,15 @@ class BasicTrainer(object):
                 all_policy_samples.extend(policy_samples)
                 all_reference_samples.extend(reference_samples)
 
-                # for prompt, sample in zip(
-                #    eval_batch["prompt"], policy_samples
-                # ):
-                #    policy_text_table.add_data(
-                #        self.example_counter, prompt, sample
-                #    )
-                # if self.config.loss.name == "dpo":
-                #    for prompt, sample in zip(
-                #        eval_batch["prompt"], reference_samples
-                #    ):
-                #        reference_text_table.add_data(
-                #            self.example_counter, prompt, sample
-                #        )
+                for sample in policy_samples:
+                   policy_text_table.add_data(
+                       self.example_counter, sample
+                   )
+                if self.config.loss.name == "dpo":
+                    for sample in reference_samples:
+                       reference_text_table.add_data(
+                           self.example_counter, sample
+                       )
 
         mean_eval_metrics = {
             k: sum(v) / len(v) for k, v in all_eval_metrics.items()
@@ -606,23 +798,25 @@ class BasicTrainer(object):
             f"eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}"
         )
         if self.config.sample_during_eval:
+            rank0_print("Policy samples:")
             rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-            if self.config.loss.name == "dpo":
-                rank0_print(json.dumps(all_reference_samples[:10], indent=2))
+            #if self.config.loss.name == "dpo":
+            #    rank0_print("Reference samples:")
+            #    rank0_print(json.dumps(all_reference_samples[:10], indent=2))
 
         if self.config.wandb.enabled and self.rank == 0:
             wandb.log(mean_eval_metrics, step=self.example_counter)
 
-            # if self.config.sample_during_eval:
-            #    wandb.log(
-            #        {"policy_samples": policy_text_table},
-            #        step=self.example_counter,
-            #    )
-            #    if self.config.loss.name == "dpo":
-            #        wandb.log(
-            #            {"reference_samples": reference_text_table},
-            #            step=self.example_counter,
-            #        )
+            if self.config.sample_during_eval:
+               wandb.log(
+                   {"policy_samples": policy_text_table},
+                   step=self.example_counter,
+               )
+               if self.config.loss.name == "dpo":
+                   wandb.log(
+                       {"reference_samples": reference_text_table},
+                       step=self.example_counter,
+                   )
 
         if (
             self.example_counter > 0
@@ -799,11 +993,17 @@ class FSDPTrainer(BasicTrainer):
         dist.barrier()
 
     def clip_gradient(self):
-        """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all GPUs."""
+        """
+        Clip the gradient norm of the parameters of an FSDP policy,
+        gathering the gradients across all GPUs.
+        """
         return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
 
     def save(self, output_dir=None, metrics=None):
-        """Save policy, optimizer, and scheduler state to disk, gathering from all processes and saving only on the rank 0 process."""
+        """
+        Save policy, optimizer, and scheduler state to disk,
+        gathering from all processes and saving only on the rank 0 process.
+        """
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(
             self.policy,
