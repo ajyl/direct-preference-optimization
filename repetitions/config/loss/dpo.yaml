@@ -7,3 +7,5 @@ beta: 0.1
 
 # if true, use a uniform (maximum entropy) reference model
 reference_free: false
+
+kl_gamma: 0.01

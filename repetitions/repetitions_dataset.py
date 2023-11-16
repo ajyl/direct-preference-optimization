@@ -133,7 +133,17 @@ def get_repetitions_batch_iterator(
                 prompt_input_ids = prompt_tokenized["input_ids"]
                 prompt_attention_mask = prompt_tokenized["attention_mask"]
 
+                gold_tokenized = tokenizer(
+                    gold,
+                    max_length=max_new_tokens,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                )
+
                 yield {
                     "prompt_input_ids": prompt_input_ids,
                     "prompt_attention_mask": prompt_attention_mask,
+                    "gold_text": gold,
+                    "gold_input_ids": gold_tokenized["input_ids"]
                 }

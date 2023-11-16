@@ -72,7 +72,6 @@ def worker_main(
     )
 
     trainer.train_loop()
-    trainer.save()
 
 
 @hydra.main(version_base=None, config_path="config", config_name="config")
