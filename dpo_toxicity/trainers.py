@@ -36,7 +36,8 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import transformers
 from omegaconf import DictConfig
 
-from dpo_toxicity.toxicity_dataset import get_toxicity_batch_iterator
+from dpo_toxicity.paradetox_dataset import get_paradetox_batch_iterator
+from dpo_toxicity.wiki103_dataset import get_wiki103_batch_iterator
 from dpo_utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -65,6 +66,47 @@ def get_prec_recall_f1(pred, gold):
     recall = 1.0 * num_overlap / (gold != GPT2_PAD_IDX).sum()
     f1 = (2 * prec * recall) / (prec + recall)
     return prec.item(), recall.item(), f1.item()
+
+
+def generate(
+    model,
+    batch,
+    max_new_tokens,
+    pad_token_id,
+    include_ngram_blocked=False,
+    include_ref=False,
+    fsdp=False,
+    ref_model=None,
+):
+    """
+    Return greedy and n-gram blocked generations.
+    """
+    prompt_shape = batch["prompt_input_ids"].shape[1]
+    with torch.no_grad():
+        # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
+        ctx = lambda: (
+            FSDP.summon_full_params(model, writeback=False, recurse=False)
+            if fsdp
+            else contextlib.nullcontext()
+        )
+        with ctx():
+            greedy_resp = model.generate(
+                input_ids=batch["prompt_input_ids"],
+                attention_mask=batch["prompt_attention_mask"],
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=pad_token_id,
+            )
+
+        greedy_resp_labels = greedy_resp.detach().clone()
+        greedy_resp_labels[:, :prompt_shape] = -100
+        output = {
+            "policy_input_ids": greedy_resp,
+            "policy_attention_mask": greedy_resp != GPT2_PAD_IDX,
+            "policy_labels": greedy_resp_labels,
+        }
+
+    return output
 
 
 def dpo_loss(
@@ -141,9 +183,9 @@ def get_kl_div(
     return pos_kl_div, neg_kl_div
 
 
-def _get_batch_logps(
+def get_batch_logps(
     logits: torch.FloatTensor,
-    labels: torch.LongTensor,
+    input_ids: torch.FloatTensor,
     average_log_prob: bool = False,
 ) -> torch.FloatTensor:
     """
@@ -162,14 +204,16 @@ def _get_batch_logps(
         A tensor of shape (batch_size,) containing the average/sum log
         probabilities of the given labels under the given logits.
     """
-    assert logits.shape[:-1] == labels.shape
 
-    labels = labels[:, 1:].clone()
+    # assert logits.shape[:-1] == labels.shape
+    # Why index by 1?
+    # [batch, seq]
+    labels = input_ids[:, 1:].clone()
     logits = logits[:, :-1, :]
-    loss_mask = labels != -100
+    loss_mask = labels != GPT2_PAD_IDX
 
     # dummy token; we'll ignore the losses on these tokens later
-    labels[labels == -100] = 0
+    labels[labels == GPT2_PAD_IDX] = 0
 
     per_token_logps = torch.gather(
         logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)
@@ -203,14 +247,14 @@ def concatenated_inputs(
     concatenated_batch = {}
     for k in batch:
         if k.startswith("pos_") and isinstance(batch[k], torch.Tensor):
-            pad_value = -100 if "labels" in k else 0
+            pad_value = -100 if "labels" in k else GPT2_PAD_IDX
             concatenated_key = k.replace("pos", "concatenated")
             concatenated_batch[concatenated_key] = pad_to_length(
                 batch[k], max_length, pad_value=pad_value
             )
     for k in batch:
         if k.startswith("neg_") and isinstance(batch[k], torch.Tensor):
-            pad_value = -100 if "labels" in k else 0
+            pad_value = -100 if "labels" in k else GPT2_PAD_IDX
             concatenated_key = k.replace("neg", "concatenated")
             concatenated_batch[concatenated_key] = torch.cat(
                 (
@@ -220,78 +264,6 @@ def concatenated_inputs(
                 dim=0,
             )
     return concatenated_batch
-
-
-def generate(
-    model,
-    batch,
-    max_new_tokens,
-    pad_token_id,
-    include_ngram_blocked=False,
-    include_ref=False,
-    fsdp=False,
-    ref_model=None,
-):
-    """
-    Return greedy and n-gram blocked generations.
-    """
-    prompt_shape = batch["prompt_input_ids"].shape[1]
-    # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
-    ctx = lambda: (
-        FSDP.summon_full_params(model, writeback=False, recurse=False)
-        if fsdp
-        else contextlib.nullcontext()
-    )
-    with ctx():
-        greedy_resp = model.generate(
-            input_ids=batch["prompt_input_ids"],
-            attention_mask=batch["prompt_attention_mask"],
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-        )
-
-    greedy_resp_labels = greedy_resp.detach().clone()
-    greedy_resp_labels[:, :prompt_shape] = -100
-    output = {
-        "neg_input_ids": greedy_resp,
-        "neg_attention_mask": greedy_resp != GPT2_PAD_IDX,
-        "neg_labels": greedy_resp_labels,
-    }
-
-    if include_ngram_blocked:
-        with ctx():
-            ngram_blocked_resp = model.generate(
-                input_ids=batch["prompt_input_ids"],
-                attention_mask=batch["prompt_attention_mask"],
-                max_new_tokens=max_new_tokens,
-                no_repeat_ngram_size=1,
-                pad_token_id=pad_token_id,
-            )
-
-        ngram_blocked_labels = ngram_blocked_resp.detach().clone()
-        ngram_blocked_labels[:, :prompt_shape] = -100
-        output["pos_input_ids"] = ngram_blocked_resp
-        output["pos_attention_mask"] = ngram_blocked_resp != GPT2_PAD_IDX
-        output["pos_labels"] = ngram_blocked_labels
-
-    if include_ref and ref_model is not None:
-        ctx = lambda: (
-            FSDP.summon_full_params(ref_model, writeback=False, recurse=False)
-            if fsdp
-            else contextlib.nullcontext()
-        )
-        with ctx():
-            ref_out = ref_model.generate(
-                input_ids=batch["prompt_input_ids"],
-                attention_mask=batch["prompt_attention_mask"],
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_token_id,
-            )
-            output["ref_input_ids"] = ref_out
-
-    return output
 
 
 class BasicTrainer(object):
@@ -344,35 +316,30 @@ class BasicTrainer(object):
         self.reference_model = reference_model
         self.kl_criterion = KLDivLoss(reduction="none", log_target=True)
 
-        self.train_iterator = get_toxicity_batch_iterator(
-            self.policy,
+        self.train_iterator = get_paradetox_batch_iterator(
             self.tokenizer,
             self.config,
             split="train",
-            n_epochs=config.n_epochs,
-            batch_size=config.batch_size,
-            max_prompt_length=config.max_prompt_length,
-            max_new_tokens=config.max_new_tokens,
-            valid_size=config.valid_size,
-            device="cuda",
         )
-        rank0_print(f"Loaded train data iterator")
-        self.eval_iterator = get_toxicity_batch_iterator(
-            self.policy,
+        self.eval_iterator = get_paradetox_batch_iterator(
             self.tokenizer,
             self.config,
             split="valid",
-            n_epochs=config.n_epochs,
-            batch_size=config.batch_size,
-            max_prompt_length=config.max_prompt_length,
-            max_new_tokens=config.max_new_tokens,
-            valid_size=config.valid_size,
-            device="cuda",
         )
+
         self.eval_batches = list(self.eval_iterator)
         rank0_print(
             f"Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}"
         )
+
+        self.wiki103_batches = None
+        if config.include_wiki103:
+            self.wiki103_iterator = get_wiki103_batch_iterator(
+                self.tokenizer,
+                self.config,
+                split="valid",
+            )
+            self.wiki103_batches = list(self.wiki103_iterator)
 
     def get_batch_samples(
         self, batch: Dict[str, torch.LongTensor]
@@ -464,9 +431,9 @@ class BasicTrainer(object):
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
         ).logits.to(torch.float32)
-        all_logps = _get_batch_logps(
+        all_logps = get_batch_logps(
             all_logits,
-            concatenated_batch["concatenated_labels"],
+            concatenated_batch["concatenated_input_ids"],
             average_log_prob=False,
         )
 
@@ -489,7 +456,6 @@ class BasicTrainer(object):
 
         metrics = {}
         train_test = "train" if train else "valid"
-        prompt_shape = batch["prompt_input_ids"].shape[1]
         kl_loss = None
 
         if loss_config.name == "dpo":
@@ -517,10 +483,10 @@ class BasicTrainer(object):
 
             pos_kl_div, neg_kl_div = get_kl_div(
                 self.kl_criterion,
-                policy_pos_logits[:, prompt_shape:],
-                policy_neg_logits[:, prompt_shape:],
-                ref_pos_logits[:, prompt_shape:],
-                ref_neg_logits[:, prompt_shape:],
+                policy_pos_logits,
+                policy_neg_logits,
+                ref_pos_logits,
+                ref_neg_logits,
             )
             if loss_config.kl_gamma > 0:
                 kl_loss = loss_config.kl_gamma * (pos_kl_div + neg_kl_div)
@@ -566,78 +532,17 @@ class BasicTrainer(object):
                 neg_kl_div.detach().cpu().numpy().tolist()
             )
 
-            repetitions_pos = get_repetitions(
-                batch["prompt_input_ids"],
-                batch["pos_input_ids"][:, prompt_shape:],
-                1,
-            )
-            repetitions_neg = get_repetitions(
-                batch["prompt_input_ids"],
-                batch["neg_input_ids"][:, prompt_shape:],
-                1,
-            )
-            pos_repetition_metric = (repetitions_pos == 0).sum(1) / (
-                repetitions_pos != -1
-            ).sum(1)
-            neg_repetition_metric = (repetitions_neg == 0).sum(1) / (
-                repetitions_neg != -1
-            ).sum(1)
-
-            metrics[f"repetitions_{train_test}/positive"] = (
-                pos_repetition_metric.cpu().numpy().tolist()
-            )
-            metrics[f"repetitions_{train_test}/negative"] = (
-                neg_repetition_metric.cpu().numpy().tolist()
-            )
             if loss_config.kl_gamma > 0 and kl_loss is not None:
                 metrics[f"kl_loss_{train_test}"] = (
                     kl_loss.detach().cpu().numpy().tolist()
                 )
-
-            policy_precs = []
-            policy_recalls = []
-            policy_f1s = []
-            for batch_idx in range(batch["gold_input_ids"].shape[0]):
-                _gold = batch["gold_input_ids"][batch_idx]
-                _gold = _gold[_gold != GPT2_PAD_IDX].unique()
-
-                _neg = batch["neg_input_ids"][batch_idx]
-                _neg = _neg[_neg != GPT2_PAD_IDX].unique()
-                neg_prec, neg_recall, neg_f1 = get_prec_recall_f1(_neg, _gold)
-                policy_precs.append(neg_prec)
-                policy_recalls.append(neg_recall)
-                policy_f1s.append(neg_f1)
-            metrics[f"policy_precision_{train_test}/negative"] = policy_precs
-            metrics[f"policy_recall_{train_test}/negative"] = policy_recalls
-            metrics[f"policy_f1_{train_test}/negative"] = policy_f1s
-
-
-            if "ref_input_ids" in batch:
-                ref_precs = []
-                ref_recalls = []
-                ref_f1s = []
-                for batch_idx in range(batch["gold_input_ids"].shape[0]):
-                    _gold = batch["gold_input_ids"][batch_idx]
-                    _gold = _gold[_gold != GPT2_PAD_IDX].unique()
-
-                    _ref = batch["ref_input_ids"][batch_idx]
-                    _ref = _ref[_ref != GPT2_PAD_IDX].unique()
-                    ref_prec, ref_recall, ref_f1 = get_prec_recall_f1(_ref, _gold)
-                    ref_precs.append(neg_prec)
-                    ref_recalls.append(neg_recall)
-                    ref_f1s.append(neg_f1)
-                metrics[f"ref_precision_{train_test}/negative"] = ref_precs
-                metrics[f"ref_recall_{train_test}/negative"] = ref_recalls
-                metrics[f"ref_f1_{train_test}/negative"] = ref_f1s
-
-
 
         elif loss_config.name == "sft":
             policy_pos_logits = self.policy(
                 batch["pos_input_ids"],
                 attention_mask=batch["pos_attention_mask"],
             ).logits.to(torch.float32)
-            policy_pos_logps = _get_batch_logps(
+            policy_pos_logps = get_batch_logps(
                 policy_pos_logits,
                 batch["pos_labels"],
                 average_log_prob=False,
@@ -661,6 +566,42 @@ class BasicTrainer(object):
 
         return losses.mean(), metrics
 
+    def get_wiki103_metrics(self, batch):
+        """
+        Get wiki103 specific metrics.
+        """
+        generations = generate(
+            self.policy,
+            batch,
+            self.config.max_new_tokens,
+            self.tokenizer.pad_token_id,
+            fsdp="FSDP" in self.config.trainer,
+        )
+        batch.update(generations)
+        local_batch = slice_and_move_batch_for_device(
+            batch, self.rank, self.world_size, self.rank
+        )
+
+        metrics = {}
+        policy_precs = []
+        policy_recalls = []
+        policy_f1s = []
+        for batch_idx in range(local_batch["gold_input_ids"].shape[0]):
+            _gold = batch["gold_input_ids"][batch_idx].to(self.rank)
+            _gold = _gold[_gold != GPT2_PAD_IDX].unique()
+
+            _generated = batch["policy_input_ids"][batch_idx]
+            _generated = _generated[_generated != GPT2_PAD_IDX].unique()
+            neg_prec, neg_recall, neg_f1 = get_prec_recall_f1(_generated, _gold)
+            policy_precs.append(neg_prec)
+            policy_recalls.append(neg_recall)
+            policy_f1s.append(neg_f1)
+        metrics["policy_precision_wiki103_valid/negative"] = policy_precs
+        metrics["policy_recall_wiki103_valid/negative"] = policy_recalls
+        metrics["policy_f1_wiki103_valid/negative"] = policy_f1s
+
+        return metrics
+
     def train_loop(self):
         """Begin either SFT or DPO training, with periodic evaluation."""
 
@@ -680,15 +621,15 @@ class BasicTrainer(object):
         random.seed(self.seed)
 
         if self.config.loss.name == "dpo":
-            result = self.reference_model.eval()
-            if result == -1:
-                return
+            self.reference_model.eval()
 
         for batch in self.train_iterator:
             if self.example_counter % self.config.eval_every == 0 and (
                 self.example_counter > 0 or self.config.do_first_eval
             ):
-                self.eval()
+                result = self.eval()
+                if result == -1:
+                    return
 
             self.train(batch)
 
@@ -703,30 +644,11 @@ class BasicTrainer(object):
         for microbatch_idx in range(self.config.gradient_accumulation_steps):
             # batch:
             # {
-            #   "prompt": List[str],
-            #   "chosen": List[str],
-            #   "rejected": List[str],
-            #   "chosen_response_only": List[str],
-            #   "rejected_response_only": List[str],
-            #   "chosen_input_ids": Tensor[batch, prompt+resp],
-            #   "chosen_attention_mask": Tensor[batch, prompt+resp],
-            #   "chosen_labels": Tensor[batch, prompt+resp],
-            #   "rejected_input_ids": Tensor[batch, prompt+resp],
-            #   "rejected_attention_mask": Tensor[batch, prompt+resp],
-            #   "rejected_labels": Tensor[batch, prompt+resp],
-            #   "prompt_input_ids": Tensor[batch, prompt],
-            #   "prompt_attention_mask": Tensor[batch, prompt],
+            #   "pos_input_ids": Tensor[batch, seq],
+            #   "pos_attention_mask": Tensor[batch, seq],
+            #   "neg_input_ids": Tensor[batch, seq],
+            #   "neg_attention_mask": Tensor[batch, seq],
             # }
-            generations = generate(
-                self.policy,
-                batch,
-                self.config.max_new_tokens,
-                self.tokenizer.pad_token_id,
-                include_ngram_blocked=True,
-                include_ref=False,
-                fsdp="FSDP" in self.config.trainer,
-            )
-            batch.update(generations)
             self.policy.train()
             global_microbatch = slice_and_move_batch_for_device(
                 batch,
@@ -786,6 +708,15 @@ class BasicTrainer(object):
         )
         self.policy.eval()
 
+        standard_eval = self._eval()
+        if self.config.include_wiki103:
+            self._wiki103_eval()
+        return standard_eval
+
+    def _eval(self):
+        """
+        Run evaluation.
+        """
         all_eval_metrics = defaultdict(list)
         if self.config.sample_during_eval:
             all_policy_samples, all_reference_samples = [], []
@@ -796,17 +727,6 @@ class BasicTrainer(object):
             else self.eval_batches
         ):
 
-            generations = generate(
-                self.policy,
-                eval_batch,
-                self.config.max_new_tokens,
-                self.tokenizer.pad_token_id,
-                include_ngram_blocked=True,
-                include_ref=True,
-                fsdp="FSDP" in self.config.trainer,
-                ref_model=self.reference_model,
-            )
-            eval_batch.update(generations)
             local_eval_batch = slice_and_move_batch_for_device(
                 eval_batch, self.rank, self.world_size, self.rank
             )
@@ -875,25 +795,20 @@ class BasicTrainer(object):
         if (
             self.val_metric_value is not None
             and self.val_metric_value * self.val_direction
-            > self.best_val_metric
+            > self.val_direction * self.best_val_metric
         ):
             self.best_val_metric = self.val_metric_value
 
             rank0_print(
-                f"New best for {self.config.validation_metric}: {self.best_val_metric}."
+                f"\n=====\nNew best for {self.config.validation_metric}: {self.best_val_metric}.\n=====\n"
             )
             self.patience = 0
 
-            if (
-                self.example_counter % self.config.save_every == 0
-                and self.val_metric_value > self.config.min_validation_value
-            ):
+            if self.example_counter % self.config.save_every == 0:
                 if self.config.debug:
                     rank0_print("skipping save in debug mode")
                 else:
-                    output_dir = os.path.join(
-                        self.run_dir, f"step-{self.example_counter}"
-                    )
+                    output_dir = os.path.join(self.run_dir, "checkpoints")
                     rank0_print(
                         f"Creating checkpoint to write to {output_dir}..."
                     )
@@ -905,6 +820,74 @@ class BasicTrainer(object):
                 return -1
 
         return 0
+
+    def _wiki103_eval(self):
+        """
+        Gather some metrics pertaining to wiki103.
+        """
+        all_eval_metrics = defaultdict(list)
+        if self.config.sample_during_eval:
+            all_policy_samples, all_reference_samples = [], []
+
+        for eval_batch in (
+            tqdm(self.wiki103_batches, desc="Computing wiki103 metrics")
+            if self.rank == 0
+            else self.wiki103_batches
+        ):
+
+            with torch.no_grad():
+                wiki103_metrics = self.get_wiki103_metrics(
+                    eval_batch,
+                )
+
+            for k, v in wiki103_metrics.items():
+                all_eval_metrics[k].extend(v)
+
+        if (
+            self.config.sample_during_eval_wiki103
+            and self.example_counter % self.config.sample_every_wiki103 == 0
+        ):
+            if self.config.n_eval_model_samples < self.config.eval_batch_size:
+                rank0_print(
+                    f"Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < \
+                    eval_batch_size ({self.config.eval_batch_size}). \
+                    Sampling from the first complete eval batch of prompts."
+                )
+                sample_batches = self.eval_batches[:1]
+            else:
+                n_sample_batches = (
+                    self.config.n_eval_model_samples
+                    // self.config.eval_batch_size
+                )
+                sample_batches = self.eval_batches[:n_sample_batches]
+
+            for eval_batch in (
+                tqdm(sample_batches, desc="Generating samples...")
+                if self.rank == 0
+                else sample_batches
+            ):
+                local_eval_batch = slice_and_move_batch_for_device(
+                    eval_batch, self.rank, self.world_size, self.rank
+                )
+                (
+                    policy_samples,
+                    reference_samples,
+                ) = self.get_batch_samples(local_eval_batch)
+
+                all_policy_samples.extend(policy_samples)
+                all_reference_samples.extend(reference_samples)
+
+            rank0_print("Policy samples:")
+            rank0_print(json.dumps(all_policy_samples[:10], indent=2))
+
+        mean_eval_metrics = {
+            k: sum(v) / len(v) for k, v in all_eval_metrics.items()
+        }
+        rank0_print(
+            f"eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}"
+        )
+        if self.config.wandb.enabled and self.rank == 0:
+            wandb.log(mean_eval_metrics, step=self.example_counter)
 
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
