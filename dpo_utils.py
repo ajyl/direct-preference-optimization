@@ -57,9 +57,7 @@ def get_local_dir(prefixes_to_resolve: List[str]) -> str:
 
 def get_local_run_dir(exp_name: str, local_dirs: List[str]) -> str:
     """Create a local directory to store outputs for this run, and return its path."""
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d_%H-%M-%S_%f")
-    run_dir = f"{get_local_dir(local_dirs)}/{exp_name}_{timestamp}"
+    run_dir = f"{get_local_dir(local_dirs)}/{exp_name}"
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
 

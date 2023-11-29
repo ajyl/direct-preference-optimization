@@ -38,6 +38,8 @@ from omegaconf import DictConfig
 
 from dpo_toxicity.paradetox_dataset import get_paradetox_batch_iterator
 from dpo_toxicity.wiki103_dataset import get_wiki103_batch_iterator
+from dpo_toxicity.pplm_dataset import get_pplm_batch_iterator
+from dpo_toxicity.toxicity_dataset import get_temporary_toxicity_batch_iterator
 from dpo_utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -247,14 +249,14 @@ def concatenated_inputs(
     concatenated_batch = {}
     for k in batch:
         if k.startswith("pos_") and isinstance(batch[k], torch.Tensor):
-            pad_value = -100 if "labels" in k else GPT2_PAD_IDX
+            pad_value = -100 if "labels" in k else 0
             concatenated_key = k.replace("pos", "concatenated")
             concatenated_batch[concatenated_key] = pad_to_length(
                 batch[k], max_length, pad_value=pad_value
             )
     for k in batch:
         if k.startswith("neg_") and isinstance(batch[k], torch.Tensor):
-            pad_value = -100 if "labels" in k else GPT2_PAD_IDX
+            pad_value = -100 if "labels" in k else 0
             concatenated_key = k.replace("neg", "concatenated")
             concatenated_batch[concatenated_key] = torch.cat(
                 (
@@ -316,21 +318,29 @@ class BasicTrainer(object):
         self.reference_model = reference_model
         self.kl_criterion = KLDivLoss(reduction="none", log_target=True)
 
-        self.train_iterator = get_paradetox_batch_iterator(
+        # self.train_iterator = get_paradetox_batch_iterator(
+        self.train_iterator = get_pplm_batch_iterator(
             self.tokenizer,
             self.config,
             split="train",
         )
-        self.eval_iterator = get_paradetox_batch_iterator(
+        # self.eval_iterator = get_paradetox_batch_iterator(
+        self.eval_iterator = get_pplm_batch_iterator(
             self.tokenizer,
             self.config,
             split="valid",
         )
-
         self.eval_batches = list(self.eval_iterator)
         rank0_print(
             f"Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}"
         )
+
+        self.toxic_data_batches = None
+        if config.include_toxic:
+            self.toxic_data_iterator = get_temporary_toxicity_batch_iterator(
+                self.tokenizer,
+            )
+            self.toxic_data_batches = list(self.toxic_data_iterator)
 
         self.wiki103_batches = None
         if config.include_wiki103:
@@ -592,7 +602,9 @@ class BasicTrainer(object):
 
             _generated = batch["policy_input_ids"][batch_idx]
             _generated = _generated[_generated != GPT2_PAD_IDX].unique()
-            neg_prec, neg_recall, neg_f1 = get_prec_recall_f1(_generated, _gold)
+            neg_prec, neg_recall, neg_f1 = get_prec_recall_f1(
+                _generated, _gold
+            )
             policy_precs.append(neg_prec)
             policy_recalls.append(neg_recall)
             policy_f1s.append(neg_f1)
@@ -711,6 +723,8 @@ class BasicTrainer(object):
         standard_eval = self._eval()
         if self.config.include_wiki103:
             self._wiki103_eval()
+        if self.config.include_toxic:
+            self._toxic_eval()
         return standard_eval
 
     def _eval(self):
@@ -879,6 +893,9 @@ class BasicTrainer(object):
 
             rank0_print("Policy samples:")
             rank0_print(json.dumps(all_policy_samples[:10], indent=2))
+            slice_and_move_batch_for_device(
+                local_eval_batch, self.rank, self.world_size, "cpu"
+            )
 
         mean_eval_metrics = {
             k: sum(v) / len(v) for k, v in all_eval_metrics.items()
@@ -888,6 +905,44 @@ class BasicTrainer(object):
         )
         if self.config.wandb.enabled and self.rank == 0:
             wandb.log(mean_eval_metrics, step=self.example_counter)
+
+    def _toxic_eval(self):
+        """
+        Gather some metrics pertaining to wiki103.
+        """
+        if self.example_counter % self.config.sample_every_toxic != 0:
+            return
+
+        policy_samples, ref_samples = [], []
+
+        for eval_batch in (
+            tqdm(
+                self.toxic_data_batches,
+                desc="Generating samples from toxic prompts",
+            )
+            if self.rank == 0
+            else self.toxic_data_batches
+        ):
+
+            local_eval_batch = slice_and_move_batch_for_device(
+                eval_batch, self.rank, self.world_size, self.rank
+            )
+            (
+                policy_samples,
+                ref_samples,
+            ) = self.get_batch_samples(local_eval_batch)
+
+            policy_samples.extend(policy_samples)
+            ref_samples.extend(ref_samples)
+
+            rank0_print("Policy samples:")
+            rank0_print(json.dumps(policy_samples, indent=2))
+            rank0_print("Ref samples:")
+            rank0_print(json.dumps(ref_samples, indent=2))
+
+            slice_and_move_batch_for_device(
+                local_eval_batch, self.rank, self.world_size, "cpu"
+            )
 
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
