@@ -100,10 +100,7 @@ def get_pplm_batch_iterator(
         data = data[-valid_size:]
     data_size = len(data)
 
-    start = 0
-    if split == "train":
-        start = 4092
-    for idx in range(start, data_size, batch_size):
+    for idx in range(0, data_size, batch_size):
         batch = data[idx : idx + batch_size]
         batch = [json.loads(x.strip()) for x in batch]
 
