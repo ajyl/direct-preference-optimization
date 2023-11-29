@@ -20,20 +20,6 @@ from dpo_constants import DATA_DIR, GPT2_PAD_IDX
 _DATA_DIR = os.path.join(DATA_DIR, "repetitions/_pairwise")
 
 
-def load_data(valid_size):
-    """
-    Load data.
-    """
-    # data = torch.load(os.path.join(_DATA_DIR, "pairwise_data.pt"))
-    data = torch.load(os.path.join(_DATA_DIR, "pairwise_98.pt"))
-    # data_size = data.shape[0]
-    # idxs = torch.randperm(data_size)
-
-    train = data[:-valid_size, ...]
-    valid = data[-valid_size:, ...]
-    return train, valid
-
-
 def load_wiki103(data_type=None):
     """
     Load Wiki103.

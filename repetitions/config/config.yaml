@@ -4,9 +4,9 @@ seed: 42
 # name for this experiment in the local run directory and on wandb
 exp_name: ???
 
-valid_size: 128
+valid_size: 64
 # the batch size for training; for FSDP, the batch size per GPU is batch_size / (grad_accumulation_steps * num_gpus)
-batch_size: 4
+batch_size: 16
 # the batch size during evaluation and sampling, if enabled
 eval_batch_size: 16
 
@@ -80,7 +80,7 @@ eval_every: 100
 save_every: 100
 validation_metric: "repetitions_valid/negative"
 validation_direction: "max"
-validation_patience: 15
+validation_patience: 35
 min_validation_value: 0.6
 
 sample_during_eval: true

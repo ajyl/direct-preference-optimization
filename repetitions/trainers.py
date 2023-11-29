@@ -221,6 +221,7 @@ def _get_batch_logps(
 
     # dummy token; we'll ignore the losses on these tokens later
     labels[labels == -100] = 0
+    breakpoint()
 
     per_token_logps = torch.gather(
         logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)
