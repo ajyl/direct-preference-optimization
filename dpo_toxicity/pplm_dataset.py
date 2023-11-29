@@ -17,45 +17,6 @@ from dpo_utils import get_local_dir, TemporarilySeededRandom
 from dpo_constants import DATA_DIR, GPT2_PAD_IDX
 
 
-_DATA_DIR = os.path.join(DATA_DIR, "repetitions/_pairwise")
-
-
-def load_wiki103(data_type=None):
-    """
-    Load Wiki103.
-    """
-    wiki_dir = os.path.join(_DATA_DIR, "wikitext-103")
-    if data_type is None:
-        data_type = ["train", "valid", "test"]
-    prompts = []
-    for _type in data_type:
-        with open(
-            os.path.join(wiki_dir, f"wiki.{_type}.tokens"), "r"
-        ) as file_p:
-            data = file_p.readlines()
-
-        filtered = []
-        for line in data:
-            if "=" in line:
-                continue
-
-            sentences = line.split(".")
-            for sent in sentences:
-                if "<unk>" in sent:
-                    continue
-                if len(sent) < 20:
-                    continue
-
-                sent = sent.strip()
-                if not sent.endswith("."):
-                    sent += "."
-
-                filtered.append(sent)
-        prompts.append(filtered)
-
-    return prompts
-
-
 def get_pplm_batch_iterator(
     tokenizer,
     config,

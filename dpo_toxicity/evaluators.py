@@ -36,6 +36,7 @@ from omegaconf import DictConfig
 
 from dpo_toxicity.paradetox_dataset import get_paradetox_batch_iterator
 from dpo_toxicity.wiki103_dataset import get_wiki103_batch_iterator
+from dpo_toxicity.toxicity_dataset import get_temporary_toxicity_batch_iterator
 from dpo_toxicity.trainers import (
     get_kl_div,
     get_batch_logps,
@@ -96,11 +97,6 @@ class BasicEvaluator(object):
         self.reference_model = reference_model
         self.kl_criterion = KLDivLoss(reduction="none", log_target=True)
 
-        self.train_iterator = get_paradetox_batch_iterator(
-            self.tokenizer,
-            self.config,
-            split="train",
-        )
         self.eval_iterator = get_paradetox_batch_iterator(
             self.tokenizer,
             self.config,
@@ -111,6 +107,11 @@ class BasicEvaluator(object):
         rank0_print(
             f"Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}"
         )
+
+        self.toxic_data_iterator = get_temporary_toxicity_batch_iterator(
+            self.tokenizer,
+        )
+        self.toxic_data_batches = list(self.toxic_data_iterator)
 
         self.wiki103_batches = None
         if config.include_wiki103:
@@ -324,6 +325,7 @@ class BasicEvaluator(object):
         self.policy.eval()
 
         standard_eval = self._eval()
+        self._eval_toxicity()
         if self.config.include_wiki103:
             self._wiki103_eval()
         return standard_eval
@@ -457,3 +459,40 @@ class BasicEvaluator(object):
         rank0_print(
             f"eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}"
         )
+
+    def _eval_toxicity(self):
+        """
+        Eval on toxic prompts.
+        """
+
+        all_policy_samples, all_ref_samples = [], []
+
+        for eval_batch in (
+            tqdm(
+                self.toxic_data_batches,
+                desc="Generating samples from toxic prompts",
+            )
+            if self.rank == 0
+            else self.toxic_data_batches
+        ):
+
+            local_eval_batch = slice_and_move_batch_for_device(
+                eval_batch, self.rank, self.world_size, self.rank
+            )
+            (
+                policy_samples,
+                ref_samples,
+            ) = self.get_batch_samples(local_eval_batch)
+
+            all_policy_samples.extend(policy_samples)
+            all_ref_samples.extend(ref_samples)
+
+            rank0_print("Policy samples:")
+            rank0_print(json.dumps(policy_samples, indent=2))
+            rank0_print("Ref samples:")
+            rank0_print(json.dumps(ref_samples, indent=2))
+
+            slice_and_move_batch_for_device(
+                local_eval_batch, self.rank, self.world_size, "cpu"
+            )
+
