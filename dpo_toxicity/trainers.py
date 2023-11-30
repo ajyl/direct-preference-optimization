@@ -10,6 +10,7 @@ import time
 import json
 import functools
 import contextlib
+from collections import Counter
 
 import numpy as np
 import wandb
@@ -39,7 +40,10 @@ from omegaconf import DictConfig
 from dpo_toxicity.paradetox_dataset import get_paradetox_batch_iterator
 from dpo_toxicity.wiki103_dataset import get_wiki103_batch_iterator
 from dpo_toxicity.pplm_dataset import get_pplm_batch_iterator
-from dpo_toxicity.toxicity_dataset import get_temporary_toxicity_batch_iterator
+from dpo_toxicity.toxicity_dataset import (
+    get_toxic_prompts_batch_iterator,
+    get_toxic_token_ids,
+)
 from dpo_utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -336,11 +340,14 @@ class BasicTrainer(object):
         )
 
         self.toxic_data_batches = None
+        self.toxic_tokens = None
         if config.include_toxic:
-            self.toxic_data_iterator = get_temporary_toxicity_batch_iterator(
+            self.toxic_data_iterator = get_toxic_prompts_batch_iterator(
                 self.tokenizer,
+                self.config.valid_size
             )
             self.toxic_data_batches = list(self.toxic_data_iterator)
+            self.toxic_tokens = get_toxic_token_ids(self.tokenizer)
 
         self.wiki103_batches = None
         if config.include_wiki103:
@@ -357,7 +364,7 @@ class BasicTrainer(object):
         """
         Generate samples from the policy (and reference model, if doing DPO training)
         for the given batch of inputs
-        ."""
+        """
 
         # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
         ctx = lambda: (
@@ -723,7 +730,10 @@ class BasicTrainer(object):
         standard_eval = self._eval()
         if self.config.include_wiki103:
             self._wiki103_eval()
-        if self.config.include_toxic:
+        if (
+            self.config.include_toxic
+            and self.example_counter % self.config.eval_toxic_every == 0
+        ):
             self._toxic_eval()
         return standard_eval
 
@@ -910,38 +920,81 @@ class BasicTrainer(object):
         """
         Gather some metrics pertaining to wiki103.
         """
-        if self.example_counter % self.config.sample_every_toxic != 0:
-            return
-
-        policy_samples, ref_samples = [], []
-
+        counts = []
+        mean_counts = []
+        immediate_counts = []
+        toxic_words = Counter(self.toxic_tokens.tolist())
         for eval_batch in (
             tqdm(
                 self.toxic_data_batches,
-                desc="Generating samples from toxic prompts",
+                desc="Evaluating toxic generation rate..",
             )
             if self.rank == 0
             else self.toxic_data_batches
         ):
-
             local_eval_batch = slice_and_move_batch_for_device(
                 eval_batch, self.rank, self.world_size, self.rank
             )
-            (
-                policy_samples,
-                ref_samples,
-            ) = self.get_batch_samples(local_eval_batch)
 
-            policy_samples.extend(policy_samples)
-            ref_samples.extend(ref_samples)
+            ctx = lambda: (
+                FSDP.summon_full_params(
+                    self.policy, writeback=False, recurse=False
+                )
+                if "FSDP" in self.config.trainer
+                else contextlib.nullcontext()
+            )
+            with ctx():
+                policy_output = self.policy.generate(
+                    local_eval_batch["prompt_input_ids"],
+                    attention_mask=local_eval_batch["prompt_attention_mask"],
+                    max_length=self.config.max_length,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+            output = policy_output[
+                :, local_eval_batch["prompt_input_ids"].shape[1] :
+            ]
+
+            for idx in range(output.shape[0]):
+                _output = Counter(output[idx].tolist())
+                common = _output & toxic_words
+                _count = sum(common.values())
+                counts.append(_count)
+                mean_counts.append(
+                    _count / (output[idx] != self.tokenizer.pad_token_id).sum().item()
+                )
+
+                _output = Counter([output[idx][0].item()])
+                common = _output & toxic_words
+                _count = sum(common.values())
+                immediate_counts.append(_count)
+
+            policy_output = pad_to_length(
+               output,
+               self.config.max_length,
+               self.tokenizer.pad_token_id,
+            )
+            policy_output = all_gather_if_needed(
+               policy_output, self.rank, self.world_size
+            )
+            policy_output_decoded = self.tokenizer.batch_decode(
+               policy_output, skip_special_tokens=True
+            )
 
             rank0_print("Policy samples:")
-            rank0_print(json.dumps(policy_samples, indent=2))
-            rank0_print("Ref samples:")
-            rank0_print(json.dumps(ref_samples, indent=2))
+            rank0_print(json.dumps(policy_output_decoded[:10], indent=2))
 
-            slice_and_move_batch_for_device(
-                local_eval_batch, self.rank, self.world_size, "cpu"
+        if self.config.wandb.enabled and self.rank == 0:
+            wandb.log(
+                {"toxicity/toxic_rate": np.mean(counts)}, step=self.example_counter
+            )
+            wandb.log(
+                {"toxicity/toxic_rate_per_utt": np.mean(mean_counts)},
+                step=self.example_counter,
+            )
+            wandb.log(
+                {"toxicity/immediate_toxic_rate": np.mean(immediate_counts)},
+                step=self.example_counter,
             )
 
     def clip_gradient(self):

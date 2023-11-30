@@ -78,21 +78,21 @@ activation_checkpointing: false
 # evaluate and save model every eval_every steps
 eval_every: 100
 save_every: 100
+eval_toxic_every: 800
 validation_metric: "loss/valid"
 validation_direction: "min"
 validation_patience: 10
 
 sample_during_eval: false
-sample_every: 400
+sample_every: 2000
 sample_during_eval_wiki103: false
 sample_every_wiki103: 800
-sample_every_toxic: 1024
 
 # prevent wandb from logging more than once per minimum_log_interval_secs
 minimum_log_interval_secs: 2.0
 
 toxicity_threshold: 0.6
-include_wiki103: true
+include_wiki103: false
 include_toxic: true
 
 defaults:
