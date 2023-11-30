@@ -2,7 +2,7 @@
 seed: 42
 
 # name for this experiment in the local run directory and on wandb
-exp_name: ???
+exp_name: first_run
 
 valid_size: 128
 # the batch size for training; for FSDP, the batch size per GPU is batch_size / (grad_accumulation_steps * num_gpus)
@@ -20,13 +20,13 @@ fsdp_port: null
 wandb:
   enabled: true
   entity: null
-  project: "dpo-toxicity"
+  project: "dpo-toxicity-pplm"
 
 # to create the local run directory and cache models/datasets,
 #   we will try each of these directories in order; if none exist,
 #   we will create the last one and use it
 local_dirs:
-  - .cache
+  - /scratch/mihalcea_root/mihalcea0/ajyl/ppo/models
 
 # whether or not to generate samples during evaluation; disable for FSDP/TensorParallel
 #   is recommended, because they are slow
@@ -78,7 +78,7 @@ activation_checkpointing: false
 # evaluate and save model every eval_every steps
 eval_every: 100
 save_every: 100
-eval_toxic_every: 800
+eval_toxic_every: 400
 validation_metric: "loss/valid"
 validation_direction: "min"
 validation_patience: 10
@@ -87,6 +87,7 @@ sample_during_eval: false
 sample_every: 2000
 sample_during_eval_wiki103: false
 sample_every_wiki103: 800
+sample_every_toxic: 800
 
 # prevent wandb from logging more than once per minimum_log_interval_secs
 minimum_log_interval_secs: 2.0

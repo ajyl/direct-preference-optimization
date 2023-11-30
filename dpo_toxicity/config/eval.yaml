@@ -1,7 +1,6 @@
 # random seed for batch sampling
 seed: 42
 
-# name for this experiment in the local run directory and on wandb
 exp_name: ???
 
 valid_size: 128
@@ -20,7 +19,7 @@ fsdp_port: null
 #   we will try each of these directories in order; if none exist,
 #   we will create the last one and use it
 local_dirs:
-  - .cache
+  - /scratch/mihalcea_root/mihalcea0/ajyl/ppo/models
 
 # whether or not to generate samples during evaluation; disable for FSDP/TensorParallel
 #   is recommended, because they are slow
@@ -51,3 +50,4 @@ defaults:
 - _self_
 - model: gpt2-medium
 - data: gpt2-medium
+- loss: dpo # which loss function, either sft or dpo (specify loss.beta if using dpo)
