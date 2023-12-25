@@ -397,7 +397,9 @@ class BasicTrainer(object):
         self.sparse_alpha = 0
 
         toxic_probe = load_probe(config.probe_path)
-        self.mlp_vectors = get_mlp_weights(self.policy, toxic_probe, 30)
+        self.mlp_vectors = get_mlp_weights(
+            self.policy, toxic_probe, config.num_mlp_vecs
+        )
         # self.freeze_weights()
         # breakpoint()
         # print("z")
@@ -443,7 +445,6 @@ class BasicTrainer(object):
                         breakpoint()
 
             weight.grad *= mask
-
 
     def get_batch_samples(
         self, batch: Dict[str, torch.LongTensor]
@@ -588,15 +589,15 @@ class BasicTrainer(object):
             metrics[f"dpo_loss_{train_test}"] = (
                 losses.detach().cpu().numpy().tolist()
             )
-            #zero_norm_loss = get_zero_norm_loss(
+            # zero_norm_loss = get_zero_norm_loss(
             #    self.policy, self.reference_model
-            #)
-            #zero_norm_loss *= self.sparse_alpha
-            #losses += zero_norm_loss
+            # )
+            # zero_norm_loss *= self.sparse_alpha
+            # losses += zero_norm_loss
 
-            #metrics[
+            # metrics[
             #    f"zero_norm_loss_{train_test}"
-            #] = zero_norm_loss.detach().cpu()
+            # ] = zero_norm_loss.detach().cpu()
 
             pos_kl_div, neg_kl_div = get_kl_div(
                 self.kl_criterion,

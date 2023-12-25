@@ -98,6 +98,7 @@ include_toxic: true
 sparse_alpha: 0.00001
 
 probe_path: "toxic_probe.pt"
+num_mlp_vecs: 30
 
 defaults:
 - _self_
