@@ -42,6 +42,7 @@ from sparse.toxicity_dataset import (
     get_toxic_prompts_batch_iterator,
     get_toxic_token_ids,
 )
+from sparse.wiki103_dataset import get_wiki103_batch_iterator
 from dpo_utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -309,6 +310,31 @@ def concatenated_inputs(
     return concatenated_batch
 
 
+class Classifier(torch.nn.Module):
+    def __init__(self, lm, classifier_head):
+        super(Classifier, self).__init__()
+        self.lm = lm.transformer
+        self.classifier_head = classifier_head
+
+    def forward(self, x):
+        output = self.lm(x)
+        # [batch seq d_model]
+        last_hidden = output["last_hidden_state"]
+        mask = (
+            x.ne(GPT2_PAD_IDX)
+            .unsqueeze(-1)
+            .repeat(1, 1, last_hidden.shape[-1])
+            .to(last_hidden.device)
+        )
+        last_hidden *= mask
+        # [batch d_model]
+        avg = torch.sum(last_hidden, dim=1) / (
+            torch.sum(mask, dim=1).detach() + 1e-10
+        )
+        logits = F.linear(avg, self.classifier_head.to(avg.device))
+        return F.log_softmax(logits, dim=-1)
+
+
 class BasicTrainer(object):
     def __init__(
         self,
@@ -390,9 +416,9 @@ class BasicTrainer(object):
             self.wiki103_iterator = get_wiki103_batch_iterator(
                 self.tokenizer,
                 self.config,
-                split="valid",
+                split="train",
             )
-            self.wiki103_batches = list(self.wiki103_iterator)
+            # self.wiki103_batches = list(self.wiki103_iterator)
 
         self.sparse_alpha = config.sparse_alpha
 
@@ -401,6 +427,7 @@ class BasicTrainer(object):
             self.policy, toxic_probe, config.num_mlp_vecs
         )
         self.sparse_mask = None
+        self.classifier = Classifier(self.policy, toxic_probe)
 
     def init_mask(self):
         """
@@ -445,8 +472,8 @@ class BasicTrainer(object):
         """
         for name, weight in self.policy.named_parameters():
             mask = self.sparse_mask[name]
-            #binary_mask = F.sigmoid(mask)
-            #weight.grad *= binary_mask
+            # binary_mask = F.sigmoid(mask)
+            # weight.grad *= binary_mask
             weight.grad *= mask.to(weight.device)
 
     def get_batch_samples(
@@ -592,16 +619,16 @@ class BasicTrainer(object):
             metrics[f"dpo_loss_{train_test}"] = (
                 losses.detach().cpu().numpy().tolist()
             )
-            #zero_norm_loss = self.get_mask_loss()
-            #zero_norm_loss *= self.sparse_alpha
-            #losses += zero_norm_loss
+            # zero_norm_loss = self.get_mask_loss()
+            # zero_norm_loss *= self.sparse_alpha
+            # losses += zero_norm_loss
 
-            #metrics[f"dpo_loss_after_mask_{train_test}"] = (
+            # metrics[f"dpo_loss_after_mask_{train_test}"] = (
             #    losses.detach().cpu().numpy().tolist()
-            #)
-            #metrics[f"zero_norm_loss_{train_test}"] = [
+            # )
+            # metrics[f"zero_norm_loss_{train_test}"] = [
             #    zero_norm_loss.detach().cpu()
-            #]
+            # ]
 
             pos_kl_div, neg_kl_div = get_kl_div(
                 self.kl_criterion,
@@ -748,7 +775,11 @@ class BasicTrainer(object):
             self.reference_model.eval()
 
         self.sparse_mask = self.build_mask(
-            self.train_iterator, self.config.loss, 0.001, 10000
+            # self.train_iterator, self.config.loss, 0.001, 500
+            self.wiki103_iterator,
+            self.config.loss,
+            0.001,
+            500,
         )
 
         for batch in self.train_iterator:
@@ -761,12 +792,14 @@ class BasicTrainer(object):
 
             self.train(batch)
 
-    def build_mask(self, data_iterator, loss_config, keep_ratio, num_samples_for_mask):
+    def build_mask(
+        self, data_iterator, loss_config, keep_ratio, num_samples_for_mask
+    ):
         """
         Build mask based on FISH.
         """
-        gradients = self.gather_gradients(
-            data_iterator, loss_config, num_samples_for_mask
+        gradients = self.gather_gradients_clf(
+            data_iterator, num_samples_for_mask
         )
 
         sizes = {}
@@ -791,12 +824,12 @@ class BasicTrainer(object):
 
         for k, v in sizes.items():
             end_idx = curr_idx + torch.prod(torch.tensor(v))
-            mask_dict[k] = masks[curr_idx: end_idx].reshape(v)
+            mask_dict[k] = masks[curr_idx:end_idx].reshape(v)
             curr_idx = end_idx
 
         assert curr_idx == len(masks)
+        breakpoint()
         return mask_dict
-
 
     def gather_gradients(
         self, data_iterator, loss_config, num_samples_for_mask
@@ -851,6 +884,25 @@ class BasicTrainer(object):
             )
 
             losses.mean().backward()
+
+            for name, param in self.policy.named_parameters():
+                gradients_dict[name] += torch.square(param.grad).data
+            self.policy.zero_grad()
+
+        return gradients_dict
+
+    def gather_gradients_clf(self, data_iterator, num_samples_for_mask):
+        gradients_dict = {}
+        for name, param in self.policy.named_parameters():
+            gradients_dict[name] = torch.zeros_like(param).to(param.device)
+
+        print("Computing gradients_dict")
+        for idx, batch in tqdm(enumerate(data_iterator)):
+            if idx * batch["prompt_input_ids"].shape[0] > num_samples_for_mask:
+                break
+
+            loss = self.classifier(batch["prompt_input_ids"])
+            loss.mean().backward()
 
             for name, param in self.policy.named_parameters():
                 gradients_dict[name] += torch.square(param.grad).data
@@ -1063,19 +1115,19 @@ class BasicTrainer(object):
         if self.config.sample_during_eval:
             all_policy_samples, all_reference_samples = [], []
 
-        for eval_batch in (
-            tqdm(self.wiki103_batches, desc="Computing wiki103 metrics")
-            if self.rank == 0
-            else self.wiki103_batches
-        ):
+        # for eval_batch in (
+        #    tqdm(self.wiki103_batches, desc="Computing wiki103 metrics")
+        #    if self.rank == 0
+        #    else self.wiki103_batches
+        # ):
 
-            with torch.no_grad():
-                wiki103_metrics = self.get_wiki103_metrics(
-                    eval_batch,
-                )
+        #    with torch.no_grad():
+        #        wiki103_metrics = self.get_wiki103_metrics(
+        #            eval_batch,
+        #        )
 
-            for k, v in wiki103_metrics.items():
-                all_eval_metrics[k].extend(v)
+        #    for k, v in wiki103_metrics.items():
+        #        all_eval_metrics[k].extend(v)
 
         if (
             self.config.sample_during_eval_wiki103
