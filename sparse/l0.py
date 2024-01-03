@@ -370,6 +370,9 @@ class BasicTrainer(object):
         self.rank = rank
         self.world_size = world_size
         self.config = config
+        if self.config.gradient_accumulation_steps != 1:
+            breakpoint()
+
         self.run_dir = run_dir
         self.example_counter = 0
         self.batch_counter = 0
@@ -395,14 +398,15 @@ class BasicTrainer(object):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        #self.policy = policy
+        # self.policy = policy
         self.model = policy
         self.reference_model = reference_model
         self.reference_model.eval()
         self.orig_model = {
-            name: param for name, param in self.reference_model.named_parameters()
+            name: param
+            for name, param in self.reference_model.named_parameters()
         }
-        #self.reference_model = reference_model
+        # self.reference_model = reference_model
         self.kl_criterion = KLDivLoss(reduction="none", log_target=True)
 
         # self.train_iterator = get_paradetox_batch_iterator(
@@ -441,13 +445,6 @@ class BasicTrainer(object):
             # self.wiki103_batches = list(self.wiki103_iterator)
 
         self.sparse_alpha = config.sparse_alpha
-
-        #toxic_probe = load_probe(config.probe_path)
-        #self.mlp_vectors = get_mlp_weights(
-        #    self.policy, toxic_probe, config.num_mlp_vecs
-        #)
-        self.sparse_mask = None
-        # self.classifier = Classifier(self.policy, toxic_probe)
         self.init_diff()
 
         self.concrete_lower = config.concrete_lower
@@ -472,12 +469,11 @@ class BasicTrainer(object):
             self.diff_params.append(diff_param)
             self.diff_params_map[name] = diff_param
 
-            # alpha = torch.zeros_like(param.data) + self.config.alpha_init
-            # alpha.requires_grad = True
-            # alpha.grad = torch.zeros_like(param.data)
-            # self.alpha_params_map[name] = alpha
-            # self.alpha_params.append(alpha)
-
+            alpha = torch.zeros_like(param.data) + self.config.alpha_init
+            alpha.requires_grad = True
+            alpha.grad = torch.zeros_like(param.data)
+            self.alpha_params_map[name] = alpha
+            self.alpha_params.append(alpha)
 
     def get_batch_samples(
         self, batch: Dict[str, torch.LongTensor]
@@ -496,7 +492,7 @@ class BasicTrainer(object):
             else contextlib.nullcontext()
         )
         with ctx():
-            policy_output = self.policy.generate(
+            policy_output = self.model.generate(
                 batch["prompt_input_ids"],
                 attention_mask=batch["prompt_attention_mask"],
                 max_length=self.config.max_length,
@@ -595,9 +591,9 @@ class BasicTrainer(object):
         metrics = {}
         train_test = "train" if train else "valid"
         kl_loss = None
-        #breakpoint()
-        self.set_policy_weights()
-        #breakpoint()
+        # breakpoint()
+        grad_params = self.set_policy_weights()
+        # breakpoint()
 
         (
             policy_pos_logps,
@@ -606,7 +602,7 @@ class BasicTrainer(object):
             policy_neg_logits,
         ) = self.concatenated_forward(self.model, batch)
 
-        #breakpoint()
+        # breakpoint()
         with torch.no_grad():
             (
                 ref_pos_logps,
@@ -615,7 +611,7 @@ class BasicTrainer(object):
                 ref_neg_logits,
             ) = self.concatenated_forward(self.reference_model, batch)
 
-        #breakpoint()
+        # breakpoint()
         losses, pos_rewards, neg_rewards = dpo_loss(
             policy_pos_logps,
             policy_neg_logps,
@@ -698,7 +694,15 @@ class BasicTrainer(object):
             all_devices_losses.cpu().numpy().tolist()
         )
 
-        return losses.mean(), metrics
+        metrics[f"sparsity/l0_penalty_{train_test}"] = (
+            #[x.item() for x in grad_params["l0"]]
+            grad_params["l0"].detach().cpu().numpy().tolist()
+        )
+        metrics[f"sparsity/nonzero_params_{train_test}"] = [
+            grad_params["nonzero_params"]
+        ]
+
+        return losses.mean(), grad_params, metrics
 
     def get_wiki103_metrics(self, batch):
         """
@@ -744,14 +748,13 @@ class BasicTrainer(object):
         rank0_print(f"Using {self.config.optimizer} optimizer")
 
         self.optimizer = getattr(torch.optim, self.config.optimizer)(
-            # self.policy.parameters(), lr=self.config.lr
             self.diff_params,
             lr=self.config.lr,
         )
 
-        #self.alpha_optimizer = getattr(torch.optim, self.config.optimizer)(
-        #    self.alpha_params, lr=0.1
-        #)
+        self.alpha_optimizer = getattr(torch.optim, self.config.optimizer)(
+          self.alpha_params, lr=0.1
+        )
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
             lr_lambda=lambda step: min(
@@ -773,48 +776,41 @@ class BasicTrainer(object):
 
             self.train(batch)
 
-    def get_z(self):
-        """
-        Compute Z mask.
-        """
-        num_layers = len(self.policy.named_parameters())
-        l0_pen = [0] * num_layers
-        z_masks = []
-        z_grads = []
-
-        for idx, (name, param) in enumerate(self.policy.named_parameters()):
-            alpha = self.alpha_params_map[name]
-            _z, z_grad = concrete_stretched(
-                alpha, self.concrete_lower, self.concrete_upper
-            )
-            l0_pen[idx] += torch.sigmoid(alpha - self.log_ratio).sum()
-            z_masks.append(_z)
-            z_grads.append(z_grad)
-        return z_masks, z_grads, l0_pen
-
     def set_policy_weights(self):
         """
         Set policy weights.
         """
-        #grad_params = {}
-        for name, param in self.model.named_parameters():
-            #alpha = self.alpha_params_map[name]
-            #_z, z_grad = concrete_stretched(
-            #    alpha, self.concrete_lower, self.concrete_upper
-            #)
+        grad_params = {}
+        num_layers = len([x for x, _ in self.model.named_parameters()])
+        l0_pen = torch.Tensor([0] * num_layers).to("cuda:0")
+        nonzero_params = 0
+        for idx, (name, param) in enumerate(self.model.named_parameters()):
+            alpha = self.alpha_params_map[name]
+            _z, z_grad = concrete_stretched(
+                alpha, self.concrete_lower, self.concrete_upper
+            )
             diff = self.diff_params_map[name]
-            # param.data.copy_(ref[name] + _z.data * diff)
-            #breakpoint()
-            param.data.copy_(self.orig_model[name].data + diff.data)
+            # param.data.copy_(self.orig_model[name].data + diff.data)
+            param.data.copy_(self.orig_model[name].data + _z.data * diff.data)
 
-            #grad_params[name] = {
-            #    #"masked_params": diff * _z,
-            #    #"z_grad": z_grad,
-            #    "dense_params": diff,
-            #    #"z_mask": _z,
-            #}
+            l0_pen[idx] += torch.sigmoid(alpha - self.log_ratio).sum().to("cuda:0")
+            nonzero_params += (_z > 0).detach().sum().float().item()
 
-    def set_grads(self):
+            grad_params[name] = {
+                # "masked_params": diff * _z,
+                "z_grad": z_grad,
+                "dense_params": diff,
+                "z_mask": _z,
+            }
+
+        results = {
+            "nonzero_params": nonzero_params,
+            "l0": l0_pen,
+            "grad_params": grad_params,
+        }
+        return results
+
+    def set_grads(self, grad_params):
         """
         Set gradients.
         """
@@ -822,22 +818,15 @@ class BasicTrainer(object):
             if param.grad is None:
                 continue
 
-            #masked_param = grad_params[name]["masked_params"]
-            #dense_param = grad_params[name]["dense_params"]
-            #z_grad = grad_params[name]["z_grad"]
-            #z_mask = grad_params[name]["z_mask"]
+            # masked_param = grad_params[name]["masked_params"]
+            dense_param = grad_params[name]["dense_params"]
+            z_grad = grad_params[name]["z_grad"]
+            z_mask = grad_params[name]["z_mask"]
 
-            # self.diff_params_map[name].grad.copy_(param.grad.data * z_mask)
-            # self.alpha_params_map[name].grad.copy_(
-            #    param.grad.data * dense_param * z_grad
-            # )
-            try:
-                self.diff_params_map[name].grad.copy_(param.grad.data)
-            except:
-                breakpoint()
-            #self.alpha_params_map[name].grad.copy_(
-            #    param.grad.data * dense_param * z_grad
-            #)
+            self.diff_params_map[name].grad.copy_(param.grad.data * z_mask)
+            self.alpha_params_map[name].grad.copy_(
+                param.grad.data * dense_param * z_grad
+            )
 
     def train(self, batch):
         """
@@ -865,23 +854,35 @@ class BasicTrainer(object):
             local_microbatch = slice_and_move_batch_for_device(
                 global_microbatch, self.rank, self.world_size, self.rank
             )
-            loss, metrics = self.get_batch_metrics(
+            loss, sparse_grad_params, metrics = self.get_batch_metrics(
                 local_microbatch, self.config.loss, train=True
             )
             (loss / self.config.gradient_accumulation_steps).backward()
-            #breakpoint()
+            # breakpoint()
 
             for k, v in metrics.items():
                 batch_metrics[k].extend(v)
 
-        self.set_grads()
+        self.set_grads(sparse_grad_params["grad_params"])
+        l0_loss = self.sparse_alpha * sparse_grad_params["l0"].sum()
+        l0_loss.backward()
+
         torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.config.max_grad_norm)
+            self.model.parameters(), self.config.max_grad_norm
+        )
+        torch.nn.utils.clip_grad_norm_(
+            self.alpha_params, self.config.max_grad_norm
+        )
         grad_norm = self.clip_gradient()
         self.optimizer.step()
+        self.alpha_optimizer.step()
         self.scheduler.step()
-        #self.optimizer.zero_grad()
+        # self.optimizer.zero_grad()
         self.model.zero_grad()
+
+        for name, param in self.diff_params_map.items():
+            param.grad.zero_()
+            self.alpha_params_map[name].grad.zero_()
 
         step_time = time.time() - start_time
         examples_per_second = self.config.batch_size / step_time
@@ -947,7 +948,7 @@ class BasicTrainer(object):
                 eval_batch, self.rank, self.world_size, self.rank
             )
             with torch.no_grad():
-                _, eval_metrics = self.get_batch_metrics(
+                _, _, eval_metrics = self.get_batch_metrics(
                     local_eval_batch, self.config.loss, train=False
                 )
 
@@ -1197,9 +1198,10 @@ class BasicTrainer(object):
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
         return torch.nn.utils.clip_grad_norm_(
-            #self.policy.parameters(), self.config.max_grad_norm
-            #self.model.parameters(), self.config.max_grad_norm
-            self.diff_params, self.config.max_grad_norm
+            # self.policy.parameters(), self.config.max_grad_norm
+            # self.model.parameters(), self.config.max_grad_norm
+            self.diff_params,
+            self.config.max_grad_norm,
         ).item()
 
     def write_state_dict(

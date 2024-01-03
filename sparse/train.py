@@ -15,7 +15,7 @@ import hydra
 from omegaconf import OmegaConf, DictConfig
 import wandb
 
-import sparse.trainers as trainers
+import sparse.l0 as trainers
 from dpo_utils import (
     get_local_dir,
     get_local_run_dir,
