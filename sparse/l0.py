@@ -398,24 +398,18 @@ class BasicTrainer(object):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # self.policy = policy
         self.model = policy
         self.reference_model = reference_model
         self.reference_model.eval()
-        self.orig_model = {
-            name: param
-            for name, param in self.reference_model.named_parameters()
-        }
-        # self.reference_model = reference_model
+        for param in self.reference_model.parameters():
+            param.requires_grad = False
         self.kl_criterion = KLDivLoss(reduction="none", log_target=True)
 
-        # self.train_iterator = get_paradetox_batch_iterator(
         self.train_iterator = get_pplm_batch_iterator(
             self.tokenizer,
             self.config,
             split="train",
         )
-        # self.eval_iterator = get_paradetox_batch_iterator(
         self.eval_iterator = get_pplm_batch_iterator(
             self.tokenizer,
             self.config,
@@ -694,10 +688,14 @@ class BasicTrainer(object):
             all_devices_losses.cpu().numpy().tolist()
         )
 
-        metrics[f"sparsity/l0_penalty_{train_test}"] = (
-            #[x.item() for x in grad_params["l0"]]
-            grad_params["l0"].detach().cpu().numpy().tolist()
-        )
+        metrics[f"sparsity/l0_penalty_{train_test}"] = [
+            grad_params["l0"].detach().item()
+        ]
+        #    #grad_params["l0"].detach(), self.rank, self.world_size
+        #    #[x.item() for x in grad_params["l0"]]
+        #    #grad_params["l0"].detach().cpu().numpy().tolist()
+
+        #)
         metrics[f"sparsity/nonzero_params_{train_test}"] = [
             grad_params["nonzero_params"]
         ]
@@ -781,8 +779,8 @@ class BasicTrainer(object):
         Set policy weights.
         """
         grad_params = {}
-        num_layers = len([x for x, _ in self.model.named_parameters()])
-        l0_pen = torch.Tensor([0] * num_layers).to("cuda:0")
+        #num_layers = len([x for x, _ in self.model.named_parameters()])
+        l0_pen = 0
         nonzero_params = 0
         for idx, (name, param) in enumerate(self.model.named_parameters()):
             alpha = self.alpha_params_map[name]
@@ -790,11 +788,19 @@ class BasicTrainer(object):
                 alpha, self.concrete_lower, self.concrete_upper
             )
             diff = self.diff_params_map[name]
-            # param.data.copy_(self.orig_model[name].data + diff.data)
-            param.data.copy_(self.orig_model[name].data + _z.data * diff.data)
 
-            l0_pen[idx] += torch.sigmoid(alpha - self.log_ratio).sum().to("cuda:0")
+            attr = name.split(".")
+            ref_weight = getattr(self.reference_model, attr[0])
+            for _attr in attr[1:]:
+                ref_weight = getattr(ref_weight, _attr)
+            param.data.copy_(ref_weight + _z * diff.data)
+
+            if l0_pen == 0:
+                l0_pen += torch.sigmoid(alpha - self.log_ratio).sum()
+            else:
+                l0_pen += torch.sigmoid(alpha - self.log_ratio).sum().to(l0_pen.device)
             nonzero_params += (_z > 0).detach().sum().float().item()
+            breakpoint()
 
             grad_params[name] = {
                 # "masked_params": diff * _z,
@@ -864,7 +870,7 @@ class BasicTrainer(object):
                 batch_metrics[k].extend(v)
 
         self.set_grads(sparse_grad_params["grad_params"])
-        l0_loss = self.sparse_alpha * sparse_grad_params["l0"].sum()
+        l0_loss = self.sparse_alpha * sparse_grad_params["l0"]
         l0_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(
