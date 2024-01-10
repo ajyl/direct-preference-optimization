@@ -33,7 +33,7 @@ def get_pplm_batch_iterator(
     :valid_size: Validation size.
     """
     assert split in ["train", "valid"]
-    data_dir = os.path.join(DATA_DIR, "toxicity_pairwise/")
+    data_dir = os.path.join(DATA_DIR, "toxicity/wiki103_toxicity_pairwise/")
     batch_size = config.batch_size
     if split == "valid":
         batch_size = config.eval_batch_size

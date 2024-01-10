@@ -828,7 +828,6 @@ class BasicTrainer(object):
             curr_idx = end_idx
 
         assert curr_idx == len(masks)
-        breakpoint()
         return mask_dict
 
     def gather_gradients(

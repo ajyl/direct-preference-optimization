@@ -400,9 +400,6 @@ class BasicTrainer(object):
         self.mlp_vectors = get_mlp_weights(
             self.policy, toxic_probe, config.num_mlp_vecs
         )
-        # self.freeze_weights()
-        # breakpoint()
-        # print("z")
 
     def freeze_weights(self):
         """
@@ -430,19 +427,13 @@ class BasicTrainer(object):
                 parts = name.split(".")
                 layer = int(parts[2])
                 for mlp_idx in self.mlp_vectors.get(layer, []):
-                    try:
-                        mask[:, mlp_idx] = 1
-                    except:
-                        breakpoint()
+                    mask[:, mlp_idx] = 1
 
             elif "mlp.c_proj.weight" in name:
                 parts = name.split(".")
                 layer = int(parts[2])
                 for mlp_idx in self.mlp_vectors.get(layer, []):
-                    try:
-                        mask[mlp_idx, :] = 1
-                    except:
-                        breakpoint()
+                    mask[mlp_idx, :] = 1
 
             weight.grad *= mask
 
@@ -862,10 +853,7 @@ class BasicTrainer(object):
                 )
 
             for k, v in eval_metrics.items():
-                try:
-                    all_eval_metrics[k].extend(v)
-                except:
-                    breakpoint()
+                all_eval_metrics[k].extend(v)
 
         if (
             self.config.sample_during_eval

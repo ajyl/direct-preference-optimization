@@ -2,9 +2,9 @@
 seed: 42
 
 # name for this experiment in the local run directory and on wandb
-exp_name: ???
+exp_name: l0_first_try_lr1e-4_sparse1e-6
 
-valid_size: 64
+valid_size: 128
 # the batch size for training; for FSDP, the batch size per GPU is batch_size / (grad_accumulation_steps * num_gpus)
 batch_size: 8
 # the batch size during evaluation and sampling, if enabled
@@ -26,7 +26,7 @@ wandb:
 #   we will try each of these directories in order; if none exist,
 #   we will create the last one and use it
 local_dirs:
-  - .cache
+  - /scratch/mihalcea_root/mihalcea0/ajyl/ppo/models
 
 # whether or not to generate samples during evaluation; disable for FSDP/TensorParallel
 #   is recommended, because they are slow
@@ -41,10 +41,8 @@ do_first_eval: false
 local_run_dir: ${get_local_run_dir:${exp_name},${local_dirs}}
 
 # the learning rate
-#lr: 1e-7
-lr: 1e-4 # 0.86
-#lr: 5e-6
-#lr: 1e-6
+lr: 1e-4
+sparse_alpha: 1e-6
 
 # number of steps to accumulate over for each batch
 #   (e.g. if batch_size=4 and gradient_accumulation_steps=2, then we will
@@ -95,15 +93,18 @@ minimum_log_interval_secs: 2.0
 toxicity_threshold: 0.6
 include_wiki103: false
 include_toxic: false
-sparse_alpha: 0.00001
 
 probe_path: "toxic_probe.pt"
-num_mlp_vecs: 30
+num_mlp_vecs: 1
 
 concrete_lower: -0.1
 concrete_upper: 1.1
 alpha_init: 0.1
 group_alphas: true
+
+concrete_lower: -0.1
+concrete_upper: 1.1
+alpha_init: 0.1
 
 defaults:
 - _self_

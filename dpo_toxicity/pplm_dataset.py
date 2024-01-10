@@ -66,7 +66,8 @@ def get_pplm_batch_iterator(
         batch = [json.loads(x.strip()) for x in batch]
 
         prompt_text = [x["prompt_text"] for x in batch]
-        gold_text = [x["gold_text"] for x in batch]
+        #gold_text = [x["gold_text"] for x in batch]
+        gold_text = [x["unpert_gen_text"] for x in batch]
 
         prompt_tokenized = tokenizer(
             prompt_text,

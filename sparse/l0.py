@@ -778,7 +778,6 @@ class BasicTrainer(object):
         Set policy weights.
         """
         grad_params = {}
-        # num_layers = len([x for x, _ in self.model.named_parameters()])
         l0_pen = 0
         nonzero_params = 0
         nonzero_z = 0
