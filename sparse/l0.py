@@ -933,7 +933,7 @@ class BasicTrainer(object):
             )
             self.patience = 0
 
-            if self.example_counter % self.config.save_every == 0:
+            if self.example_counter % self.config.eval_every == 0:
                 if self.config.debug:
                     rank0_print("skipping save in debug mode")
                 else:
@@ -1139,11 +1139,12 @@ class BasicTrainer(object):
         """Save policy, optimizer, and scheduler state to disk."""
 
         policy_state_dict = self.model.state_dict()
+
         self.write_state_dict(
             self.example_counter,
-            policy_state_dict,
+            self.diff_params_map,
             metrics,
-            "policy.pt",
+            "diffs.pt",
             output_dir,
         )
         del policy_state_dict
@@ -1164,5 +1165,13 @@ class BasicTrainer(object):
             scheduler_state_dict,
             metrics,
             "scheduler.pt",
+            output_dir,
+        )
+
+        self.write_state_dict(
+            self.example_counter,
+            self.alpha_params_map,
+            None,
+            "alpha.pt",
             output_dir,
         )
