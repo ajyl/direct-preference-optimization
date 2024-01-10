@@ -66,7 +66,7 @@ def get_pplm_batch_iterator(
         batch = [json.loads(x.strip()) for x in batch]
 
         prompt_text = [x["prompt_text"] for x in batch]
-        #gold_text = [x["gold_text"] for x in batch]
+        # gold_text = [x["gold_text"] for x in batch]
         gold_text = [x["unpert_gen_text"] for x in batch]
 
         prompt_tokenized = tokenizer(
@@ -128,3 +128,92 @@ def get_pplm_batch_iterator(
             "neg_attention_mask": neg_input_ids != tokenizer.pad_token_id,
             "neg_labels": neg_labels,
         }
+
+
+def get_cached_pplm_batch_iterator(
+    config,
+    pad_token_id,
+    split: str = "train",
+    device: str = "cuda",
+) -> Iterator[Dict]:
+    """
+    Get an iterator over batches of data.
+
+    :params:
+
+    :split: Which split to use.
+    :batch_size: Batch size.
+    :valid_size: Validation size.
+    """
+    assert split in ["train", "valid"]
+    data_dir = os.path.join(DATA_DIR, "toxicity_pairwise_logits/")
+    batch_size = config.batch_size
+    if split == "valid":
+        batch_size = config.eval_batch_size
+    max_prompt_length = config.max_prompt_length
+    max_new_tokens = config.max_new_tokens
+    valid_size = config.valid_size
+
+    filenames = [
+        os.path.join(data_dir, filename)
+        for filename in os.listdir(data_dir)
+        if filename.endswith(".jsonl")
+    ]
+
+    data = []
+    for filename in tqdm(filenames):
+        with open(filename, "r") as file_p:
+            file_data = file_p.readlines()
+
+        data.extend(file_data)
+
+    if split == "train":
+        data = data[:-valid_size]
+    else:
+        data = data[-valid_size:]
+
+    data_size = len(data)
+
+    for idx in range(0, data_size):
+
+        batch = json.loads(data[idx].strip())
+        cached_batchsize = len(batch["pos_logps"])
+        if batch_size > cached_batchsize:
+            raise RuntimeError(
+                "Specified batch size is larger than cached batch size."
+            )
+
+        for key, val in batch.items():
+            if key.endswith("input_ids") or key.endswith("_labels"):
+                batch[key] = torch.LongTensor(val)
+            elif key.endswith("attention_mask"):
+                batch[key] = torch.IntTensor(val)
+
+        for inner_idx in range(0, cached_batchsize, batch_size):
+
+            yield {
+                "prompt_input_ids": batch["prompt_input_ids"][
+                    inner_idx : inner_idx + batch_size
+                ],
+                "prompt_attention_mask": batch["prompt_attention_mask"][
+                    inner_idx : inner_idx + batch_size
+                ],
+                "pos_input_ids": batch["pos_input_ids"][
+                    inner_idx : inner_idx + batch_size
+                ],
+                "pos_attention_mask": batch["pos_attention_mask"][
+                    inner_idx : inner_idx + batch_size
+                ],
+                "neg_input_ids": batch["neg_input_ids"][
+                    inner_idx : inner_idx + batch_size
+                ],
+                "neg_attention_mask": batch["neg_attention_mask"][
+                    inner_idx : inner_idx + batch_size
+                ],
+                "ref_pos_logps": torch.tensor(batch["pos_logps"])[
+                    inner_idx : inner_idx + batch_size
+                ],
+                "ref_neg_logps": torch.tensor(batch["neg_logps"])[
+                    inner_idx : inner_idx + batch_size
+                ],
+            }

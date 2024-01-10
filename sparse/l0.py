@@ -37,7 +37,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import transformers
 from omegaconf import DictConfig
 
-from sparse.pplm_dataset import get_pplm_batch_iterator
+from sparse.pplm_dataset import get_cached_pplm_batch_iterator
 from sparse.toxicity_dataset import (
     get_toxic_prompts_batch_iterator,
     get_toxic_token_ids,
@@ -135,7 +135,6 @@ def dpo_loss(
     ref_pos_logps: torch.FloatTensor,
     ref_neg_logps: torch.FloatTensor,
     beta: float,
-    reference_free: bool = False,
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
     """
     Compute the DPO loss for a batch of policy and reference model log probabilities.
@@ -148,8 +147,6 @@ def dpo_loss(
     :ref_neg_logps: logprobs of negative responses from reference model: (batch_size,)
     :beta: Temperature parameter for the DPO loss, typically something
         in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
-    :reference_free: If True, we ignore the _provided_ reference model and
-        implicitly use a reference model that assigns equal probability to all responses.
 
     :returns:
 
@@ -160,9 +157,6 @@ def dpo_loss(
     """
     pi_logratios = policy_pos_logps - policy_neg_logps
     ref_logratios = ref_pos_logps - ref_neg_logps
-
-    if reference_free:
-        ref_logratios = 0
 
     logits = pi_logratios - ref_logratios
 
@@ -209,36 +203,6 @@ def get_zero_norm_loss(policy, ref):
         except:
             breakpoint()
     return zero_norm.unsqueeze(0)
-
-
-def get_kl_div(
-    kl_criterion: KLDivLoss,
-    pos_pi_logits: torch.FloatTensor,  # [batch, seq, vocab]
-    neg_pi_logits: torch.FloatTensor,  # [batch, seq, vocab]
-    pos_ref_logits: torch.FloatTensor,  # [batch, seq, vocab]
-    neg_ref_logits: torch.FloatTensor,  # [batch, seq, vocab]
-) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-    """
-    Return KL Loss.
-    """
-    # [batch, seq, vocab] --> [batch]
-    pos_kl_div = (
-        kl_criterion(
-            F.log_softmax(pos_pi_logits, dim=-1),
-            F.log_softmax(pos_ref_logits, dim=-1),
-        )
-        .sum(dim=-1)
-        .mean(dim=-1)
-    )
-    neg_kl_div = (
-        kl_criterion(
-            F.log_softmax(neg_pi_logits, dim=-1),
-            F.log_softmax(neg_ref_logits, dim=-1),
-        )
-        .sum(dim=-1)
-        .mean(dim=-1)
-    )
-    return pos_kl_div, neg_kl_div
 
 
 def get_batch_logps(
@@ -356,7 +320,6 @@ class BasicTrainer(object):
         config: DictConfig,
         seed: int,
         run_dir: str,
-        reference_model: Optional[nn.Module] = None,
         rank: int = 0,
         world_size: int = 1,
     ):
@@ -399,20 +362,19 @@ class BasicTrainer(object):
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.model = policy
-        self.reference_model = reference_model
-        self.reference_model.eval()
-        for param in self.reference_model.parameters():
-            param.requires_grad = False
-        self.kl_criterion = KLDivLoss(reduction="none", log_target=True)
+        self.model.eval()
+        self.orig = {}
+        for name, param in self.model.named_parameters():
+            self.orig[name] = param.detach().cpu()
 
-        self.train_iterator = get_pplm_batch_iterator(
-            self.tokenizer,
+        self.train_iterator = get_cached_pplm_batch_iterator(
             self.config,
+            self.tokenizer.pad_token_id,
             split="train",
         )
-        self.eval_iterator = get_pplm_batch_iterator(
-            self.tokenizer,
+        self.eval_iterator = get_cached_pplm_batch_iterator(
             self.config,
+            self.tokenizer.pad_token_id,
             split="valid",
         )
         self.eval_batches = list(self.eval_iterator)
@@ -457,15 +419,18 @@ class BasicTrainer(object):
         self.alpha_params_map = {}
 
         for name, param in self.model.named_parameters():
+            # diff_param = torch.zeros_like(param.data, dtype=torch.bfloat16)
             diff_param = torch.zeros_like(param.data)
             diff_param.requires_grad = True
-            diff_param.grad = torch.zeros_like(param.data)
+            #diff_param.grad = torch.zeros_like(param.data)
             self.diff_params.append(diff_param)
             self.diff_params_map[name] = diff_param
 
-            alpha = torch.zeros_like(param.data) + self.config.alpha_init
+            alpha = (
+                torch.zeros_like(param.data, dtype=torch.bfloat16)
+                + self.config.alpha_init
+            )
             alpha.requires_grad = True
-            alpha.grad = torch.zeros_like(param.data)
             self.alpha_params_map[name] = alpha
             self.alpha_params.append(alpha)
 
@@ -494,23 +459,6 @@ class BasicTrainer(object):
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
-        if self.config.loss.name == "dpo":
-            ctx = lambda: (
-                FSDP.summon_full_params(
-                    self.reference_model, writeback=False, recurse=False
-                )
-                if "FSDP" in self.config.trainer
-                else contextlib.nullcontext()
-            )
-            with ctx():
-                reference_output = self.reference_model.generate(
-                    batch["prompt_input_ids"],
-                    attention_mask=batch["prompt_attention_mask"],
-                    max_length=self.config.max_length,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-
         policy_output = pad_to_length(
             policy_output, self.config.max_length, self.tokenizer.pad_token_id
         )
@@ -521,21 +469,7 @@ class BasicTrainer(object):
             policy_output, skip_special_tokens=True
         )
 
-        reference_output_decoded = []
-        if self.config.loss.name == "dpo":
-            reference_output = pad_to_length(
-                reference_output,
-                self.config.max_length,
-                self.tokenizer.pad_token_id,
-            )
-            reference_output = all_gather_if_needed(
-                reference_output, self.rank, self.world_size
-            )
-            reference_output_decoded = self.tokenizer.batch_decode(
-                reference_output, skip_special_tokens=True
-            )
-
-        return policy_output_decoded, reference_output_decoded
+        return policy_output_decoded
 
     def concatenated_forward(
         self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
@@ -584,10 +518,7 @@ class BasicTrainer(object):
 
         metrics = {}
         train_test = "train" if train else "valid"
-        kl_loss = None
-        # breakpoint()
         grad_params = self.set_policy_weights()
-        # breakpoint()
 
         (
             policy_pos_logps,
@@ -596,38 +527,20 @@ class BasicTrainer(object):
             policy_neg_logits,
         ) = self.concatenated_forward(self.model, batch)
 
-        # breakpoint()
-        with torch.no_grad():
-            (
-                ref_pos_logps,
-                ref_neg_logps,
-                ref_pos_logits,
-                ref_neg_logits,
-            ) = self.concatenated_forward(self.reference_model, batch)
+        ref_pos_logps = batch["ref_pos_logps"]
+        ref_neg_logps = batch["ref_neg_logps"]
 
-        # breakpoint()
         losses, pos_rewards, neg_rewards = dpo_loss(
             policy_pos_logps,
             policy_neg_logps,
             ref_pos_logps,
             ref_neg_logps,
             beta=loss_config.beta,
-            reference_free=loss_config.reference_free,
         )
 
         metrics[f"dpo_loss_{train_test}"] = (
             losses.detach().cpu().numpy().tolist()
         )
-        pos_kl_div, neg_kl_div = get_kl_div(
-            self.kl_criterion,
-            policy_pos_logits,
-            policy_neg_logits,
-            ref_pos_logits,
-            ref_neg_logits,
-        )
-        if loss_config.kl_gamma > 0:
-            kl_loss = loss_config.kl_gamma * (pos_kl_div + neg_kl_div)
-            losses += kl_loss
 
         reward_accuracies = (pos_rewards > neg_rewards).float()
 
@@ -661,19 +574,6 @@ class BasicTrainer(object):
             policy_neg_logps.cpu().numpy().tolist()
         )
 
-        metrics[f"kl_div_{train_test}/positive"] = (
-            pos_kl_div.detach().cpu().numpy().tolist()
-        )
-
-        metrics[f"kl_div_{train_test}/negative"] = (
-            neg_kl_div.detach().cpu().numpy().tolist()
-        )
-
-        if loss_config.kl_gamma > 0 and kl_loss is not None:
-            metrics[f"kl_loss_{train_test}"] = (
-                kl_loss.detach().cpu().numpy().tolist()
-            )
-
         policy_pos_logps = all_gather_if_needed(
             policy_pos_logps.detach(), self.rank, self.world_size
         )
@@ -695,7 +595,7 @@ class BasicTrainer(object):
         #    #[x.item() for x in grad_params["l0"]]
         #    #grad_params["l0"].detach().cpu().numpy().tolist()
 
-        #)
+        # )
         metrics[f"sparsity/nonzero_params_{train_test}"] = [
             grad_params["nonzero_params"]
         ]
@@ -751,7 +651,7 @@ class BasicTrainer(object):
         )
 
         self.alpha_optimizer = getattr(torch.optim, self.config.optimizer)(
-          self.alpha_params, lr=0.1
+            self.alpha_params, lr=0.1
         )
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
@@ -779,28 +679,31 @@ class BasicTrainer(object):
         Set policy weights.
         """
         grad_params = {}
-        #num_layers = len([x for x, _ in self.model.named_parameters()])
+        # num_layers = len([x for x, _ in self.model.named_parameters()])
         l0_pen = 0
         nonzero_params = 0
         for idx, (name, param) in enumerate(self.model.named_parameters()):
             alpha = self.alpha_params_map[name]
+            alpha.grad = torch.zeros_like(alpha.data)
+
             _z, z_grad = concrete_stretched(
                 alpha, self.concrete_lower, self.concrete_upper
             )
             diff = self.diff_params_map[name]
+            diff.grad = torch.zeros_like(param.data)
 
-            attr = name.split(".")
-            ref_weight = getattr(self.reference_model, attr[0])
-            for _attr in attr[1:]:
-                ref_weight = getattr(ref_weight, _attr)
-            param.data.copy_(ref_weight + _z * diff.data)
+            ref_weight = self.orig[name]
+            param.data.copy_(ref_weight.to(diff.device) + _z * diff.data)
 
             if l0_pen == 0:
                 l0_pen += torch.sigmoid(alpha - self.log_ratio).sum()
             else:
-                l0_pen += torch.sigmoid(alpha - self.log_ratio).sum().to(l0_pen.device)
+                l0_pen += (
+                    torch.sigmoid(alpha - self.log_ratio)
+                    .sum()
+                    .to(l0_pen.device)
+                )
             nonzero_params += (_z > 0).detach().sum().float().item()
-            breakpoint()
 
             grad_params[name] = {
                 # "masked_params": diff * _z,
@@ -838,7 +741,7 @@ class BasicTrainer(object):
         """
         Run single train step.
         """
-        self.model.train()
+        # self.model.train()
 
         start_time = time.time()
         batch_metrics = defaultdict(list)
@@ -850,7 +753,7 @@ class BasicTrainer(object):
             #   "neg_input_ids": Tensor[batch, seq],
             #   "neg_attention_mask": Tensor[batch, seq],
             # }
-            self.model.train()
+            # self.model.train()
             global_microbatch = slice_and_move_batch_for_device(
                 batch,
                 microbatch_idx,
@@ -864,7 +767,6 @@ class BasicTrainer(object):
                 local_microbatch, self.config.loss, train=True
             )
             (loss / self.config.gradient_accumulation_steps).backward()
-            # breakpoint()
 
             for k, v in metrics.items():
                 batch_metrics[k].extend(v)
@@ -874,21 +776,26 @@ class BasicTrainer(object):
         l0_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.config.max_grad_norm
-        )
-        torch.nn.utils.clip_grad_norm_(
             self.alpha_params, self.config.max_grad_norm
+        )
+        self.alpha_optimizer.step()
+
+        for name, param in self.alpha_params_map.items():
+            self.alpha_params_map[name].grad.zero_()
+
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), self.config.max_grad_norm
         )
         grad_norm = self.clip_gradient()
         self.optimizer.step()
-        self.alpha_optimizer.step()
         self.scheduler.step()
         # self.optimizer.zero_grad()
-        self.model.zero_grad()
+        #self.model.zero_grad()
+        self.optimizer.zero_grad()
+        self.alpha_optimizer.zero_grad()
 
-        for name, param in self.diff_params_map.items():
-            param.grad.zero_()
-            self.alpha_params_map[name].grad.zero_()
+        #for name, param in self.diff_params_map.items():
+        #    param.grad.zero_()
 
         step_time = time.time() - start_time
         examples_per_second = self.config.batch_size / step_time
@@ -942,7 +849,7 @@ class BasicTrainer(object):
         """
         all_eval_metrics = defaultdict(list)
         if self.config.sample_during_eval:
-            all_policy_samples, all_reference_samples = [], []
+            all_policy_samples = []
 
         for eval_batch in (
             tqdm(self.eval_batches, desc="Computing eval metrics")
@@ -990,13 +897,9 @@ class BasicTrainer(object):
                 local_eval_batch = slice_and_move_batch_for_device(
                     eval_batch, self.rank, self.world_size, self.rank
                 )
-                (
-                    policy_samples,
-                    reference_samples,
-                ) = self.get_batch_samples(local_eval_batch)
+                (policy_samples,) = self.get_batch_samples(local_eval_batch)
 
                 all_policy_samples.extend(policy_samples)
-                all_reference_samples.extend(reference_samples)
 
             rank0_print("Policy samples:")
             rank0_print(json.dumps(all_policy_samples[:10], indent=2))
@@ -1053,7 +956,7 @@ class BasicTrainer(object):
         """
         all_eval_metrics = defaultdict(list)
         if self.config.sample_during_eval:
-            all_policy_samples, all_reference_samples = [], []
+            all_policy_samples = []
 
         # for eval_batch in (
         #    tqdm(self.wiki103_batches, desc="Computing wiki103 metrics")
@@ -1095,13 +998,9 @@ class BasicTrainer(object):
                 local_eval_batch = slice_and_move_batch_for_device(
                     eval_batch, self.rank, self.world_size, self.rank
                 )
-                (
-                    policy_samples,
-                    reference_samples,
-                ) = self.get_batch_samples(local_eval_batch)
+                (policy_samples,) = self.get_batch_samples(local_eval_batch)
 
                 all_policy_samples.extend(policy_samples)
-                all_reference_samples.extend(reference_samples)
 
             rank0_print("Policy samples:")
             rank0_print(json.dumps(all_policy_samples[:10], indent=2))
@@ -1267,166 +1166,3 @@ class BasicTrainer(object):
             "scheduler.pt",
             output_dir,
         )
-
-
-class FSDPTrainer(BasicTrainer):
-    def __init__(
-        self,
-        policy: nn.Module,
-        config: DictConfig,
-        seed: int,
-        run_dir: str,
-        reference_model: Optional[nn.Module] = None,
-        rank: int = 0,
-        world_size: int = 1,
-    ):
-        """A trainer subclass that uses PyTorch FSDP to shard the model across multiple GPUs.
-
-        This trainer will shard both the policy and reference model across all available GPUs.
-        Models are sharded at the block level, where the block class name is provided in the config.
-        """
-
-        breakpoint()
-        super().__init__(
-            policy, config, seed, run_dir, reference_model, rank, world_size
-        )
-        assert (
-            config.model.block_name is not None
-        ), "must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP"
-
-        wrap_class = get_block_class_from_model(
-            policy, config.model.block_name
-        )
-        model_auto_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={wrap_class},
-        )
-
-        shared_fsdp_kwargs = dict(
-            auto_wrap_policy=model_auto_wrap_policy,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            cpu_offload=CPUOffload(offload_params=False),
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            device_id=rank,
-            ignored_modules=None,
-            limit_all_gathers=False,
-            use_orig_params=False,
-            sync_module_states=False,
-        )
-
-        rank0_print("Sharding policy...")
-        mp_dtype = (
-            getattr(torch, config.model.fsdp_policy_mp)
-            if config.model.fsdp_policy_mp is not None
-            else None
-        )
-        policy_mp_policy = MixedPrecision(
-            param_dtype=mp_dtype, reduce_dtype=mp_dtype, buffer_dtype=mp_dtype
-        )
-        self.policy = FSDP(
-            policy, **shared_fsdp_kwargs, mixed_precision=policy_mp_policy
-        )
-
-        if config.activation_checkpointing:
-            rank0_print("Attempting to enable activation checkpointing...")
-            try:
-                # use activation checkpointing, according to:
-                # https://pytorch.org/blog/scaling-multimodal-foundation-models-in-torchmultimodal-with-pytorch-distributed/
-                #
-                # first, verify we have FSDP activation support ready by importing:
-                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-                    checkpoint_wrapper,
-                    apply_activation_checkpointing,
-                    CheckpointImpl,
-                )
-
-                non_reentrant_wrapper = functools.partial(
-                    checkpoint_wrapper,
-                    offload_to_cpu=False,
-                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-                )
-            except Exception as e:
-                rank0_print("FSDP activation checkpointing not available:", e)
-            else:
-                check_fn = lambda submodule: isinstance(submodule, wrap_class)
-                rank0_print(
-                    "Applying activation checkpointing wrapper to policy..."
-                )
-                apply_activation_checkpointing(
-                    self.policy,
-                    checkpoint_wrapper_fn=non_reentrant_wrapper,
-                    check_fn=check_fn,
-                )
-                rank0_print("FSDP activation checkpointing enabled!")
-
-        if config.loss.name == "dpo":
-            rank0_print("Sharding reference model...")
-            self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
-
-        print("Loaded model on rank", rank)
-        dist.barrier()
-
-    def clip_gradient(self):
-        """
-        Clip the gradient norm of the parameters of an FSDP policy,
-        gathering the gradients across all GPUs.
-        """
-        return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
-
-    def save(self, output_dir=None, metrics=None):
-        """
-        Save policy, optimizer, and scheduler state to disk,
-        gathering from all processes and saving only on the rank 0 process.
-        """
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(
-            self.policy,
-            StateDictType.FULL_STATE_DICT,
-            state_dict_config=save_policy,
-        ):
-            policy_state_dict = self.policy.state_dict()
-
-        if self.rank == 0:
-            self.write_state_dict(
-                self.example_counter,
-                policy_state_dict,
-                metrics,
-                "policy.pt",
-                output_dir,
-            )
-        del policy_state_dict
-        dist.barrier()
-
-        save_policy = FullOptimStateDictConfig(
-            offload_to_cpu=True, rank0_only=True
-        )
-        with FSDP.state_dict_type(
-            self.policy,
-            StateDictType.FULL_STATE_DICT,
-            optim_state_dict_config=save_policy,
-        ):
-            optimizer_state_dict = FSDP.optim_state_dict(
-                self.policy, self.optimizer
-            )
-
-        if self.rank == 0:
-            self.write_state_dict(
-                self.example_counter,
-                optimizer_state_dict,
-                metrics,
-                "optimizer.pt",
-                output_dir,
-            )
-        del optimizer_state_dict
-        dist.barrier()
-
-        if self.rank == 0:
-            scheduler_state_dict = self.scheduler.state_dict()
-            self.write_state_dict(
-                self.example_counter,
-                scheduler_state_dict,
-                metrics,
-                "scheduler.pt",
-                output_dir,
-            )
-        dist.barrier()

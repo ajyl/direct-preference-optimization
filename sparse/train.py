@@ -36,7 +36,6 @@ def worker_main(
     world_size: int,
     config: DictConfig,
     policy: nn.Module,
-    reference_model: Optional[nn.Module] = None,
 ):
     """
     Main function for each worker process
@@ -66,7 +65,6 @@ def worker_main(
         config,
         config.seed,
         config.local_run_dir,
-        reference_model=reference_model,
         rank=rank,
         world_size=world_size,
     )
@@ -128,20 +126,6 @@ def main(config: DictConfig):
     )
     disable_dropout(policy)
 
-    if config.loss.name == "dpo":
-        print("building reference model")
-        reference_model_dtype = getattr(torch, config.model.reference_dtype)
-        reference_model = transformers.AutoModelForCausalLM.from_pretrained(
-            config.model.name_or_path,
-            cache_dir=get_local_dir(config.local_dirs),
-            low_cpu_mem_usage=True,
-            torch_dtype=reference_model_dtype,
-            **model_kwargs,
-        )
-        disable_dropout(reference_model)
-    else:
-        reference_model = None
-
     if config.model.archive is not None:
         state_dict = torch.load(config.model.archive, map_location="cpu")
         step, metrics = state_dict["step_idx"], state_dict["metrics"]
@@ -151,9 +135,6 @@ def main(config: DictConfig):
             {json.dumps(metrics, indent=2)}"
         )
         policy.load_state_dict(state_dict["state"])
-        if config.loss.name == "dpo":
-            reference_model.load_state_dict(state_dict["state"])
-
         print("loaded pre-trained weights")
 
     if "FSDP" in config.trainer:
@@ -165,12 +146,12 @@ def main(config: DictConfig):
         mp.spawn(
             worker_main,
             nprocs=world_size,
-            args=(world_size, config, policy, reference_model),
+            args=(world_size, config, policy),
             join=True,
         )
     else:
         print("starting single-process worker")
-        worker_main(0, 1, config, policy, reference_model)
+        worker_main(0, 1, config, policy)
 
 
 if __name__ == "__main__":
