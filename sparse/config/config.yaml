@@ -6,7 +6,7 @@ exp_name: ???
 
 valid_size: 64
 # the batch size for training; for FSDP, the batch size per GPU is batch_size / (grad_accumulation_steps * num_gpus)
-batch_size: 1
+batch_size: 8
 # the batch size during evaluation and sampling, if enabled
 eval_batch_size: 8
 
@@ -20,7 +20,7 @@ fsdp_port: null
 wandb:
   enabled: true
   entity: null
-  project: "dpo-toxicity-pplm"
+  project: "dpo-sparse"
 
 # to create the local run directory and cache models/datasets,
 #   we will try each of these directories in order; if none exist,
@@ -56,7 +56,7 @@ max_grad_norm: 10.0
 
 # the maximum allowed length for an input (prompt + response)
 max_length: 256
-max_new_tokens: 256
+max_new_tokens: 64
 
 # the maximum allowed length for a prompt
 max_prompt_length: 64
@@ -95,14 +95,15 @@ minimum_log_interval_secs: 2.0
 toxicity_threshold: 0.6
 include_wiki103: false
 include_toxic: false
-sparse_alpha: 0.000000125
+sparse_alpha: 0.00001
 
 probe_path: "toxic_probe.pt"
 num_mlp_vecs: 30
 
 concrete_lower: -0.1
 concrete_upper: 1.1
-alpha_init: 5
+alpha_init: 0.1
+group_alphas: true
 
 defaults:
 - _self_

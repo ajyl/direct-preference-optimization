@@ -391,16 +391,8 @@ class BasicTrainer(object):
             self.toxic_data_batches = list(self.toxic_data_iterator)
             self.toxic_tokens = get_toxic_token_ids(self.tokenizer)
 
-        self.wiki103_batches = None
-        if config.include_wiki103:
-            self.wiki103_iterator = get_wiki103_batch_iterator(
-                self.tokenizer,
-                self.config,
-                split="train",
-            )
-            # self.wiki103_batches = list(self.wiki103_iterator)
-
         self.sparse_alpha = config.sparse_alpha
+        self.group_alphas = config.group_alphas
         self.init_diff()
 
         self.concrete_lower = config.concrete_lower
@@ -417,12 +409,14 @@ class BasicTrainer(object):
         self.diff_params_map = {}
         self.alpha_params = []
         self.alpha_params_map = {}
+        self.alpha_groups = []
+        self.alpha_groups_map = {}
 
         for name, param in self.model.named_parameters():
             # diff_param = torch.zeros_like(param.data, dtype=torch.bfloat16)
             diff_param = torch.zeros_like(param.data)
             diff_param.requires_grad = True
-            #diff_param.grad = torch.zeros_like(param.data)
+            # diff_param.grad = torch.zeros_like(param.data)
             self.diff_params.append(diff_param)
             self.diff_params_map[name] = diff_param
 
@@ -433,6 +427,16 @@ class BasicTrainer(object):
             alpha.requires_grad = True
             self.alpha_params_map[name] = alpha
             self.alpha_params.append(alpha)
+
+            if self.group_alphas:
+                alpha = (
+                    torch.zeros((1)).to(param.device) + self.config.alpha_init
+                )
+                alpha.requires_grad = True
+                alpha.grad = torch.zeros_like(alpha)
+
+                self.alpha_groups_map[name] = alpha
+                self.alpha_groups.append(alpha)
 
     def get_batch_samples(
         self, batch: Dict[str, torch.LongTensor]
@@ -599,46 +603,13 @@ class BasicTrainer(object):
         metrics[f"sparsity/nonzero_params_{train_test}"] = [
             grad_params["nonzero_params"]
         ]
-
+        metrics[f"sparsity/nonzero_z_{train_test}"] = [
+            grad_params["nonzero_z"]
+        ]
+        metrics[f"sparsity/nonzero_groups_{train_test}"] = [
+            grad_params["nonzero_groups"]
+        ]
         return losses.mean(), grad_params, metrics
-
-    def get_wiki103_metrics(self, batch):
-        """
-        Get wiki103 specific metrics.
-        """
-        generations = generate(
-            self.policy,
-            batch,
-            self.config.max_new_tokens,
-            self.tokenizer.pad_token_id,
-            fsdp="FSDP" in self.config.trainer,
-        )
-        batch.update(generations)
-        local_batch = slice_and_move_batch_for_device(
-            batch, self.rank, self.world_size, self.rank
-        )
-
-        metrics = {}
-        policy_precs = []
-        policy_recalls = []
-        policy_f1s = []
-        for batch_idx in range(local_batch["gold_input_ids"].shape[0]):
-            _gold = batch["gold_input_ids"][batch_idx].to(self.rank)
-            _gold = _gold[_gold != GPT2_PAD_IDX].unique()
-
-            _generated = batch["policy_input_ids"][batch_idx]
-            _generated = _generated[_generated != GPT2_PAD_IDX].unique()
-            neg_prec, neg_recall, neg_f1 = get_prec_recall_f1(
-                _generated, _gold
-            )
-            policy_precs.append(neg_prec)
-            policy_recalls.append(neg_recall)
-            policy_f1s.append(neg_f1)
-        metrics["policy_precision_wiki103_valid/negative"] = policy_precs
-        metrics["policy_recall_wiki103_valid/negative"] = policy_recalls
-        metrics["policy_f1_wiki103_valid/negative"] = policy_f1s
-
-        return metrics
 
     def train_loop(self):
         """Begin either SFT or DPO training, with periodic evaluation."""
@@ -651,7 +622,7 @@ class BasicTrainer(object):
         )
 
         self.alpha_optimizer = getattr(torch.optim, self.config.optimizer)(
-            self.alpha_params, lr=0.1
+            self.alpha_params + self.alpha_groups, lr=0.1
         )
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
@@ -682,19 +653,17 @@ class BasicTrainer(object):
         # num_layers = len([x for x, _ in self.model.named_parameters()])
         l0_pen = 0
         nonzero_params = 0
+        nonzero_z = 0
+        nonzero_groups = 0
         for idx, (name, param) in enumerate(self.model.named_parameters()):
+
+            # Alpha params
             alpha = self.alpha_params_map[name]
             alpha.grad = torch.zeros_like(alpha.data)
 
-            _z, z_grad = concrete_stretched(
+            _z, _z_grad = concrete_stretched(
                 alpha, self.concrete_lower, self.concrete_upper
             )
-            diff = self.diff_params_map[name]
-            diff.grad = torch.zeros_like(param.data)
-
-            ref_weight = self.orig[name]
-            param.data.copy_(ref_weight.to(diff.device) + _z * diff.data)
-
             if l0_pen == 0:
                 l0_pen += torch.sigmoid(alpha - self.log_ratio).sum()
             else:
@@ -703,17 +672,49 @@ class BasicTrainer(object):
                     .sum()
                     .to(l0_pen.device)
                 )
-            nonzero_params += (_z > 0).detach().sum().float().item()
+
+            _grouped_z = 1
+            _grouped_z_grad = 1
+            if self.group_alphas:
+                alpha_group = self.alpha_groups_map[name]
+                alpha_group.grad = torch.zeros_like(alpha_group.data)
+                _grouped_z, _grouped_z_grad = concrete_stretched(
+                    alpha_group, self.concrete_lower, self.concrete_upper
+                )
+                l0_pen += (
+                    torch.sigmoid(alpha_group - self.log_ratio)
+                    .sum()
+                    .to(l0_pen.device)
+                )
+
+            mask = _z * _grouped_z
+
+            # Diff params
+            diff = self.diff_params_map[name]
+            diff.grad = torch.zeros_like(param.data)
+
+            ref_weight = self.orig[name]
+            param.data.copy_(ref_weight.to(diff.device) + mask * diff.data)
+
+            nonzero_z += (_z > 0).detach().sum().float().item()
+            nonzero_params += (mask > 0).detach().sum().float().item()
+            if self.group_alphas:
+                nonzero_groups += (
+                    (_grouped_z > 0).detach().sum().float().item()
+                )
 
             grad_params[name] = {
-                # "masked_params": diff * _z,
-                "z_grad": z_grad,
+                "z_grad": _z_grad,
+                "group_z_grad": _grouped_z_grad,
                 "dense_params": diff,
-                "z_mask": _z,
+                "z": _z,
+                "group_z": _grouped_z,
             }
 
         results = {
             "nonzero_params": nonzero_params,
+            "nonzero_z": nonzero_z,
+            "nonzero_groups": nonzero_groups,
             "l0": l0_pen,
             "grad_params": grad_params,
         }
@@ -727,15 +728,21 @@ class BasicTrainer(object):
             if param.grad is None:
                 continue
 
-            # masked_param = grad_params[name]["masked_params"]
-            dense_param = grad_params[name]["dense_params"]
+            diff_param = grad_params[name]["dense_params"]
+            z_mask = grad_params[name]["z"]
             z_grad = grad_params[name]["z_grad"]
-            z_mask = grad_params[name]["z_mask"]
+            group_z_mask = grad_params[name]["group_z"]
+            group_z_grad = grad_params[name]["group_z_grad"]
+            mask = z_mask * group_z_mask
 
-            self.diff_params_map[name].grad.copy_(param.grad.data * z_mask)
+            self.diff_params_map[name].grad.copy_(param.grad.data * mask)
             self.alpha_params_map[name].grad.copy_(
-                param.grad.data * dense_param * z_grad
+                param.grad.data * diff_param * z_mask * z_grad
             )
+            if self.group_alphas:
+                self.alpha_groups_map[name].grad.copy_(
+                   (param.grad.data * diff_param * group_z_mask * group_z_grad).sum()
+                )
 
     def train(self, batch):
         """
@@ -790,11 +797,11 @@ class BasicTrainer(object):
         self.optimizer.step()
         self.scheduler.step()
         # self.optimizer.zero_grad()
-        #self.model.zero_grad()
+        # self.model.zero_grad()
         self.optimizer.zero_grad()
         self.alpha_optimizer.zero_grad()
 
-        #for name, param in self.diff_params_map.items():
+        # for name, param in self.diff_params_map.items():
         #    param.grad.zero_()
 
         step_time = time.time() - start_time
