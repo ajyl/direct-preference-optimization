@@ -167,6 +167,8 @@ def get_cached_pplm_batch_iterator(
 
         data.extend(file_data)
 
+    # TODO: valid size is incorrect - each element in `data`
+    # is already 16 samples.
     if split == "train":
         data = data[:-valid_size]
     else:

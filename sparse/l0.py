@@ -35,6 +35,7 @@ from torch.distributed.fsdp.api import (
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import transformers
+import einops
 from omegaconf import DictConfig
 
 from sparse.pplm_dataset import get_cached_pplm_batch_iterator
@@ -42,7 +43,6 @@ from sparse.toxicity_dataset import (
     get_toxic_prompts_batch_iterator,
     get_toxic_token_ids,
 )
-from sparse.wiki103_dataset import get_wiki103_batch_iterator
 from dpo_utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -56,22 +56,6 @@ from sparse.sparse_utils import load_probe, get_mlp_weights
 from dpo_constants import GPT2_PAD_IDX
 
 torch.backends.cuda.matmul.allow_tf32 = True
-
-
-def get_prec_recall_f1(pred, gold):
-    """
-    Calculate prec, recall, f1 for 1d tensors.
-    """
-    a_cat_b, counts = torch.cat([gold, pred]).unique(return_counts=True)
-    intersection = a_cat_b[torch.where(counts.gt(1))]
-    if intersection.numel() == 0:
-        return 0, 0, 0
-
-    num_overlap = counts[counts.gt(1)].sum() - counts[counts.gt(1)].numel()
-    prec = 1.0 * num_overlap / (pred != GPT2_PAD_IDX).sum()
-    recall = 1.0 * num_overlap / (gold != GPT2_PAD_IDX).sum()
-    f1 = (2 * prec * recall) / (prec + recall)
-    return prec.item(), recall.item(), f1.item()
 
 
 def concrete_stretched(alpha, l=-0.1, r=1.1):
@@ -167,44 +151,6 @@ def dpo_loss(
     return losses, pos_rewards, neg_rewards
 
 
-def get_zero_norm_loss(policy, ref):
-    zero_norm = 0
-    for name, weight in policy.named_parameters():
-        attr = name.split(".")
-        ref_weight = getattr(ref, attr[0])
-        for _attr in attr[1:]:
-            ref_weight = getattr(ref_weight, _attr)
-
-        dim = 1
-        if (
-            "ln_1" in name
-            or "ln_2" in name
-            or "ln_f" in name
-            or "c_attn" in name
-            or "mlp.c_fc" in name
-            or "bias" in name
-        ):
-            dim = 0
-
-        try:
-            _norm = torch.linalg.vector_norm(
-                weight - ref_weight, ord=0, dim=dim
-            )
-            if name.endswith("c_attn.bias"):
-                _norm = (_norm / 3072).sum()
-            elif name.endswith("mlp.c_fc.bias"):
-                _norm = (_norm / 4096).sum()
-            else:
-                _norm = (_norm / 1024).sum()
-            if isinstance(zero_norm, torch.Tensor):
-                zero_norm += _norm.to(zero_norm.device)
-            else:
-                zero_norm += _norm
-        except:
-            breakpoint()
-    return zero_norm.unsqueeze(0)
-
-
 def get_batch_logps(
     logits: torch.FloatTensor,
     input_ids: torch.FloatTensor,
@@ -288,29 +234,125 @@ def concatenated_inputs(
     return concatenated_batch
 
 
-class Classifier(torch.nn.Module):
-    def __init__(self, lm, classifier_head):
-        super(Classifier, self).__init__()
-        self.lm = lm.transformer
-        self.classifier_head = classifier_head
+def reshape_group_mask(name, z_mask, group_masks, group_grad, config):
+    """
+    Construct mask.
+    """
+    group_mask = group_masks.get(name)
+    n_heads = config.n_head
+    d_model = config.n_embd
+    d_mlp = config.n_inner if config.n_inner is not None else 4 * d_model
+    vocab = config.vocab_size
+    pos = config.n_positions
 
-    def forward(self, x):
-        output = self.lm(x)
-        # [batch seq d_model]
-        last_hidden = output["last_hidden_state"]
-        mask = (
-            x.ne(GPT2_PAD_IDX)
-            .unsqueeze(-1)
-            .repeat(1, 1, last_hidden.shape[-1])
-            .to(last_hidden.device)
-        )
-        last_hidden *= mask
-        # [batch d_model]
-        avg = torch.sum(last_hidden, dim=1) / (
-            torch.sum(mask, dim=1).detach() + 1e-10
-        )
-        logits = F.linear(avg, self.classifier_head.to(avg.device))
-        return F.log_softmax(logits, dim=-1)
+    if ".mlp." in name:
+        if "c_fc.weight" in name:
+            # z_mask: [d_model, d_mlp]
+            # group_mask: [d_mlp]
+            assert z_mask.shape == (d_model, d_mlp)
+            _group_mask = group_mask.unsqueeze(0).repeat((z_mask.shape[0], 1))
+            _group_grad = group_grad.unsqueeze(0).repeat((z_mask.shape[0], 1))
+
+        elif "c_fc.bias" in name:
+            # z_mask: [d_mlp]
+            # group_mask: [1]
+            assert z_mask.shape == (d_mlp,)
+            _group_mask = group_mask.repeat(z_mask.shape[0])
+            _group_grad = group_grad.repeat(z_mask.shape[0])
+
+        elif "c_proj.weight" in name:
+            # z_mask: [d_mlp, d_model]
+            # group_mask: [d_mlp]
+            assert z_mask.shape == (d_mlp, d_model)
+            _group_mask = group_mask.unsqueeze(-1).repeat((1, z_mask.shape[1]))
+            _group_grad = group_grad.unsqueeze(-1).repeat((1, z_mask.shape[1]))
+
+        elif "c_proj.bias" in name:
+            # z_mask: [d_model]
+            # group_mask: [1]
+            assert z_mask.shape == (d_model,)
+            _group_mask = group_mask.repeat(z_mask.shape[0])
+            _group_grad = group_grad.repeat(z_mask.shape[0])
+
+        else:
+            raise RuntimeError("Unexpected mask type.")
+
+    elif ".attn." in name:
+        if "c_attn.bias" in name:
+            # z_mask: [d_model * 3]
+            # group_mask: [1]
+            assert z_mask.shape == (d_model * 3,)
+            _group_mask = group_mask.repeat(z_mask.shape[0])
+            _group_grad = group_grad.repeat(z_mask.shape[0])
+
+        elif "c_attn.weight" in name:
+            # z_mask: [d_model, d_model * 3]
+            assert z_mask.shape == (d_model, d_model * 3)
+            w_q = torch.concat(
+                [
+                    group_masks[f"{name}.q.{head_idx}"]
+                    for head_idx in range(n_heads)
+                ],
+                dim=0,
+            )
+            w_k = torch.concat(
+                [
+                    group_masks[f"{name}.k.{head_idx}"]
+                    for head_idx in range(n_heads)
+                ],
+                dim=0,
+            )
+            w_v = torch.concat(
+                [
+                    group_masks[f"{name}.v.{head_idx}"]
+                    for head_idx in range(n_heads)
+                ],
+                dim=0,
+            )
+            # Should be [3 * num_heads * d_attn]
+            _group_mask = torch.concat([w_q, w_k, w_v], dim=0)
+            _group_mask = _group_mask.unsqueeze(0).repeat((d_model, 1))
+            _group_grad = group_grad.unsqueeze(0).repeat((d_model, 1))
+
+        elif "c_proj.bias" in name:
+            # z_mask: [d_model]
+            # group_mask: [1]
+            assert z_mask.shape == (d_model,)
+            _group_mask = group_mask.repeat(z_mask.shape[0])
+            _group_grad = group_grad.repeat(z_mask.shape[0])
+
+        elif "c_proj.weight" in name:
+            # z_mask: [d_model, d_model]
+            # group_mask: [d_model]
+            assert z_mask.shape == (d_model, d_model)
+            _group_mask = group_mask.unsqueeze(-1).repeat((1, z_mask.shape[1]))
+            _group_grad = group_grad.unsqueeze(-1).repeat((1, z_mask.shape[1]))
+
+    elif "ln_1" in name or "ln_2" in name or "ln_f" in name:
+        # z_mask: [d_model]
+        # group_mask: [1]
+        assert z_mask.shape == (d_model,)
+        _group_mask = group_mask.repeat(z_mask.shape[0])
+        _group_grad = group_grad.repeat(z_mask.shape[0])
+
+    elif "wte" in name:
+        # z_mask: [vocab, d_model]
+        # group_mask: [vocab]
+        assert z_mask.shape == (vocab, d_model)
+        _group_mask = group_mask.unsqueeze(-1).repeat((1, z_mask.shape[1]))
+        _group_grad = group_grad.unsqueeze(-1).repeat((1, z_mask.shape[1]))
+
+    elif "wpe" in name:
+        # z_mask: [pos, d_model]
+        # group_mask: [pos]
+        assert z_mask.shape == (pos, d_model)
+        _group_mask = group_mask.unsqueeze(-1).repeat((1, z_mask.shape[1]))
+        _group_grad = group_grad.unsqueeze(-1).repeat((1, z_mask.shape[1]))
+
+    if z_mask.shape != _group_mask.shape:
+        breakpoint()
+    # TODO: _group_mask device should be set elsewhere?
+    return _group_mask, _group_grad
 
 
 class BasicTrainer(object):
@@ -393,7 +435,22 @@ class BasicTrainer(object):
 
         self.sparse_alpha = config.sparse_alpha
         self.group_alphas = config.group_alphas
+
+        self.diff_params = []
+        self.diff_params_map = {}
+        self.alpha_params = []
+        self.alpha_params_map = {}
+        self.alpha_groups = []
+        self.alpha_groups_map = {}
+
         self.init_diff()
+        if self.group_alphas:
+            self.init_grouped_mask()
+
+        # mask size should be 346387
+        #mask_size = 0
+        #for name, mask in self.alpha_groups_map.items():
+        #    mask_size += mask.numel()
 
         self.concrete_lower = config.concrete_lower
         self.concrete_upper = config.concrete_upper
@@ -405,13 +462,6 @@ class BasicTrainer(object):
         """
         Init diff stuff.
         """
-        self.diff_params = []
-        self.diff_params_map = {}
-        self.alpha_params = []
-        self.alpha_params_map = {}
-        self.alpha_groups = []
-        self.alpha_groups_map = {}
-
         for name, param in self.model.named_parameters():
             # diff_param = torch.zeros_like(param.data, dtype=torch.bfloat16)
             diff_param = torch.zeros_like(param.data)
@@ -428,15 +478,91 @@ class BasicTrainer(object):
             self.alpha_params_map[name] = alpha
             self.alpha_params.append(alpha)
 
-            if self.group_alphas:
-                alpha = (
-                    torch.zeros((1)).to(param.device) + self.config.alpha_init
-                )
-                alpha.requires_grad = True
-                alpha.grad = torch.zeros_like(alpha)
+    def init_grouped_mask(self):
+        """
+        Init group mask.
+        """
 
-                self.alpha_groups_map[name] = alpha
-                self.alpha_groups.append(alpha)
+        def _add_alpha(name, _shape):
+            _alpha = torch.zeros((_shape)) + self.config.alpha_init
+            _alpha.requires_grad = True
+            _alpha.grad = torch.zeros_like(_alpha)
+
+            self.alpha_groups_map[name] = _alpha
+            self.alpha_groups.append(_alpha)
+
+        for name, param in self.model.named_parameters():
+
+            # MLP
+            if ".mlp." in name:
+                if "c_fc.weight" in name:
+                    # [d_model, d_mlp]
+                    _add_alpha(name, param.shape[1])
+
+                elif "c_fc.bias" in name:
+                    # [d_mlp]
+                    _add_alpha(name, 1)
+
+                elif "c_proj.weight" in name:
+                    # [d_mlp, d_model]
+                    _add_alpha(name, param.shape[0])
+
+                elif "c_proj.bias" in name:
+                    _add_alpha(name, 1)
+
+                else:
+                    raise RuntimeError("Unexpected group mask.")
+
+            elif ".attn." in name:
+                if "c_attn.bias" in name:
+                    # [d_model * 3]
+                    _add_alpha(name, 1)
+
+                elif "c_attn.weight" in name:
+                    num_heads = self.model.config.n_head
+                    # [d_model, d_model * 3] -> [d_model, 3 * num_heads * d_attn]
+                    w_q, w_k, w_v = torch.tensor_split(param, 3, dim=1)
+
+                    # [heads, d_model, d_attn]
+                    w_q = einops.rearrange(
+                        w_q, "m (i h) -> i m h", i=num_heads
+                    )
+                    w_k = einops.rearrange(
+                        w_k, "m (i h) -> i m h", i=num_heads
+                    )
+                    w_v = einops.rearrange(
+                        w_v, "m (i h) -> i m h", i=num_heads
+                    )
+                    for head_idx in range(num_heads):
+                        _add_alpha(f"{name}.q.{head_idx}", w_q.shape[2])
+                        _add_alpha(f"{name}.k.{head_idx}", w_q.shape[2])
+                        _add_alpha(f"{name}.v.{head_idx}", w_q.shape[2])
+
+                elif "c_proj.bias" in name:
+                    # [d_model]
+                    _add_alpha(name, 1)
+
+                elif "c_proj.weight" in name:
+                    # [d_model, d_model]
+                    _add_alpha(name, param.shape[1])
+
+                else:
+                    raise RuntimeError("Unexpected group mask.")
+
+            elif "ln_1" in name or "ln_2" in name or "ln_f" in name:
+                # Note: this if-case also handles bias params.
+                _add_alpha(name, 1)
+
+            elif "wte" in name:
+                # [vocab, d_model]
+                _add_alpha(name, param.shape[0])
+
+            elif "wpe" in name:
+                # [pos, d_model]
+                _add_alpha(name, param.shape[0])
+
+            else:
+                raise RuntimeError("Unexpected group mask.")
 
     def get_batch_samples(
         self, batch: Dict[str, torch.LongTensor]
@@ -595,11 +721,6 @@ class BasicTrainer(object):
         metrics[f"sparsity/l0_penalty_{train_test}"] = [
             grad_params["l0"].detach().item()
         ]
-        #    #grad_params["l0"].detach(), self.rank, self.world_size
-        #    #[x.item() for x in grad_params["l0"]]
-        #    #grad_params["l0"].detach().cpu().numpy().tolist()
-
-        # )
         metrics[f"sparsity/nonzero_params_{train_test}"] = [
             grad_params["nonzero_params"]
         ]
@@ -674,20 +795,86 @@ class BasicTrainer(object):
                 )
 
             _grouped_z = 1
-            _grouped_z_grad = 1
+            _grouped_z_grad = torch.ones((1))
             if self.group_alphas:
-                alpha_group = self.alpha_groups_map[name]
-                alpha_group.grad = torch.zeros_like(alpha_group.data)
-                _grouped_z, _grouped_z_grad = concrete_stretched(
-                    alpha_group, self.concrete_lower, self.concrete_upper
-                )
-                l0_pen += (
-                    torch.sigmoid(alpha_group - self.log_ratio)
-                    .sum()
-                    .to(l0_pen.device)
-                )
+                if name.endswith("attn.c_attn.weight"):
 
-            mask = _z * _grouped_z
+                    for i in range(self.model.config.n_head):
+                        self.alpha_groups_map[
+                            f"{name}.q.{i}"
+                        ].grad = torch.zeros_like(
+                            self.alpha_groups_map[f"{name}.q.{i}"]
+                        )
+                        self.alpha_groups_map[
+                            f"{name}.k.{i}"
+                        ].grad = torch.zeros_like(
+                            self.alpha_groups_map[f"{name}.k.{i}"]
+                        )
+                        self.alpha_groups_map[
+                            f"{name}.v.{i}"
+                        ].grad = torch.zeros_like(
+                            self.alpha_groups_map[f"{name}.v.{i}"]
+                        )
+
+                    w_q = torch.concat(
+                        [
+                            self.alpha_groups_map[f"{name}.q.{head_idx}"]
+                            for head_idx in range(self.model.config.n_head)
+                        ],
+                        dim=0,
+                    )
+                    w_k = torch.concat(
+                        [
+                            self.alpha_groups_map[f"{name}.k.{head_idx}"]
+                            for head_idx in range(self.model.config.n_head)
+                        ],
+                        dim=0,
+                    )
+                    w_v = torch.concat(
+                        [
+                            self.alpha_groups_map[f"{name}.v.{head_idx}"]
+                            for head_idx in range(self.model.config.n_head)
+                        ],
+                        dim=0,
+                    )
+
+                    alpha_group = torch.concat([w_q, w_k, w_v], dim=0)
+                    alpha_group.grad = torch.zeros_like(alpha_group.data)
+                    _grouped_z, _grouped_z_grad = concrete_stretched(
+                        alpha_group,
+                        self.concrete_lower,
+                        self.concrete_upper,
+                    )
+                    l0_pen += (
+                        torch.sigmoid(alpha_group - self.log_ratio)
+                        .sum()
+                        .to(l0_pen.device)
+                    )
+
+                else:
+                    alpha_group = self.alpha_groups_map[name]
+                    alpha_group.grad = torch.zeros_like(alpha_group.data)
+                    _grouped_z, _grouped_z_grad = concrete_stretched(
+                        alpha_group, self.concrete_lower, self.concrete_upper
+                    )
+                    l0_pen += (
+                        torch.sigmoid(alpha_group - self.log_ratio)
+                        .sum()
+                        .to(l0_pen.device)
+                    )
+
+            mask = _z
+            group_grad = None
+            group_mask = None
+            if self.group_alphas:
+                group_mask, group_grad = reshape_group_mask(
+                    name,
+                    _z,
+                    self.alpha_groups_map,
+                    _grouped_z_grad,
+                    self.model.config,
+                )
+                mask = _z * group_mask.to(_z.device)
 
             # Diff params
             diff = self.diff_params_map[name]
@@ -705,10 +892,10 @@ class BasicTrainer(object):
 
             grad_params[name] = {
                 "z_grad": _z_grad,
-                "group_z_grad": _grouped_z_grad,
+                "group_z_grad": group_grad,
                 "dense_params": diff,
                 "z": _z,
-                "group_z": _grouped_z,
+                "group_z": group_mask,
             }
 
         results = {
@@ -730,26 +917,117 @@ class BasicTrainer(object):
 
             diff_param = grad_params[name]["dense_params"]
             z_mask = grad_params[name]["z"]
-            z_grad = grad_params[name]["z_grad"]
             group_z_mask = grad_params[name]["group_z"]
             group_z_grad = grad_params[name]["group_z_grad"]
-            mask = z_mask * group_z_mask
+            z_grad = grad_params[name]["z_grad"]
 
+            mask = z_mask
+            if self.group_alphas:
+                mask = z_mask * group_z_mask.to(z_mask.device)
             self.diff_params_map[name].grad.copy_(param.grad.data * mask)
             self.alpha_params_map[name].grad.copy_(
                 param.grad.data * diff_param * z_mask * z_grad
             )
             if self.group_alphas:
-                self.alpha_groups_map[name].grad.copy_(
-                   (param.grad.data * diff_param * group_z_mask * group_z_grad).sum()
-                )
+                if "c_attn.weight" in name:
+                    num_heads = self.model.config.n_head
+                    # TODO
+                    d_model = 1024
+                    q_param, k_param, v_param = torch.tensor_split(
+                        param.grad.data, 3, dim=1
+                    )
+                    q_diff, k_diff, v_diff = torch.tensor_split(
+                        diff_param, 3, dim=1
+                    )
+                    q_mask, k_mask, v_mask = torch.tensor_split(
+                        group_z_mask, 3, dim=1
+                    )
+                    q_z_grad, k_z_grad, v_z_grad = torch.tensor_split(
+                        group_z_grad, 3, dim=1
+                    )
+
+                    q_param = einops.rearrange(
+                        q_param, "m (i h) -> i m h", i=num_heads
+                    )
+                    k_param = einops.rearrange(
+                        k_param, "m (i h) -> i m h", i=num_heads
+                    )
+                    v_param = einops.rearrange(
+                        v_param, "m (i h) -> i m h", i=num_heads
+                    )
+
+                    q_diff = einops.rearrange(
+                        q_diff, "m (i h) -> i m h", i=num_heads
+                    )
+                    k_diff = einops.rearrange(
+                        k_diff, "m (i h) -> i m h", i=num_heads
+                    )
+                    v_diff = einops.rearrange(
+                        v_diff, "m (i h) -> i m h", i=num_heads
+                    )
+
+                    q_mask = einops.rearrange(
+                        q_mask, "m (i h) -> i m h", i=num_heads
+                    )
+                    k_mask = einops.rearrange(
+                        k_mask, "m (i h) -> i m h", i=num_heads
+                    )
+                    v_mask = einops.rearrange(
+                        v_mask, "m (i h) -> i m h", i=num_heads
+                    )
+
+                    q_z_grad = einops.rearrange(
+                        q_z_grad, "m (i h) -> i m h", i=num_heads
+                    )
+                    k_z_grad = einops.rearrange(
+                        k_z_grad, "m (i h) -> i m h", i=num_heads
+                    )
+                    v_z_grad = einops.rearrange(
+                        v_z_grad, "m (i h) -> i m h", i=num_heads
+                    )
+
+                    for i in range(num_heads):
+                        self.alpha_groups_map[f"{name}.q.{i}"].grad.copy_(
+                            (
+                                q_param[i]
+                                * q_diff[i]
+                                * q_mask[i].to(q_param.device)
+                                * q_z_grad[i].to(q_param.device)
+                            ).sum()
+                        )
+
+                        self.alpha_groups_map[f"{name}.k.{i}"].grad.copy_(
+                            (
+                                k_param[i]
+                                * k_diff[i]
+                                * k_mask[i].to(k_param.device)
+                                * k_z_grad[i].to(k_param.device)
+                            ).sum()
+                        )
+
+                        self.alpha_groups_map[f"{name}.v.{i}"].grad.copy_(
+                            (
+                                v_param[i]
+                                * v_diff[i]
+                                * v_mask[i].to(v_param.device)
+                                * v_z_grad[i].to(v_param.device)
+                            ).sum()
+                        )
+
+                else:
+                    self.alpha_groups_map[name].grad.copy_(
+                        (
+                            param.grad.data
+                            * diff_param
+                            * group_z_mask.to(param.device)
+                            * group_z_grad.to(param.device)
+                        ).sum()
+                    )
 
     def train(self, batch):
         """
         Run single train step.
         """
-        # self.model.train()
-
         start_time = time.time()
         batch_metrics = defaultdict(list)
         for microbatch_idx in range(self.config.gradient_accumulation_steps):
@@ -760,7 +1038,6 @@ class BasicTrainer(object):
             #   "neg_input_ids": Tensor[batch, seq],
             #   "neg_attention_mask": Tensor[batch, seq],
             # }
-            # self.model.train()
             global_microbatch = slice_and_move_batch_for_device(
                 batch,
                 microbatch_idx,
@@ -787,8 +1064,8 @@ class BasicTrainer(object):
         )
         self.alpha_optimizer.step()
 
-        for name, param in self.alpha_params_map.items():
-            self.alpha_params_map[name].grad.zero_()
+        # for name, param in self.alpha_params_map.items():
+        #    self.alpha_params_map[name].grad.zero_()
 
         torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), self.config.max_grad_norm
@@ -796,13 +1073,8 @@ class BasicTrainer(object):
         grad_norm = self.clip_gradient()
         self.optimizer.step()
         self.scheduler.step()
-        # self.optimizer.zero_grad()
-        # self.model.zero_grad()
         self.optimizer.zero_grad()
         self.alpha_optimizer.zero_grad()
-
-        # for name, param in self.diff_params_map.items():
-        #    param.grad.zero_()
 
         step_time = time.time() - start_time
         examples_per_second = self.config.batch_size / step_time
@@ -841,8 +1113,6 @@ class BasicTrainer(object):
         self.model.eval()
 
         standard_eval = self._eval()
-        if self.config.include_wiki103:
-            self._wiki103_eval()
         if (
             self.config.include_toxic
             and self.example_counter % self.config.eval_toxic_every == 0
@@ -956,73 +1226,6 @@ class BasicTrainer(object):
                 return -1
 
         return 0
-
-    def _wiki103_eval(self):
-        """
-        Gather some metrics pertaining to wiki103.
-        """
-        all_eval_metrics = defaultdict(list)
-        if self.config.sample_during_eval:
-            all_policy_samples = []
-
-        # for eval_batch in (
-        #    tqdm(self.wiki103_batches, desc="Computing wiki103 metrics")
-        #    if self.rank == 0
-        #    else self.wiki103_batches
-        # ):
-
-        #    with torch.no_grad():
-        #        wiki103_metrics = self.get_wiki103_metrics(
-        #            eval_batch,
-        #        )
-
-        #    for k, v in wiki103_metrics.items():
-        #        all_eval_metrics[k].extend(v)
-
-        if (
-            self.config.sample_during_eval_wiki103
-            and self.example_counter % self.config.sample_every_wiki103 == 0
-        ):
-            if self.config.n_eval_model_samples < self.config.eval_batch_size:
-                rank0_print(
-                    f"Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < \
-                    eval_batch_size ({self.config.eval_batch_size}). \
-                    Sampling from the first complete eval batch of prompts."
-                )
-                sample_batches = self.eval_batches[:1]
-            else:
-                n_sample_batches = (
-                    self.config.n_eval_model_samples
-                    // self.config.eval_batch_size
-                )
-                sample_batches = self.eval_batches[:n_sample_batches]
-
-            for eval_batch in (
-                tqdm(sample_batches, desc="Generating samples...")
-                if self.rank == 0
-                else sample_batches
-            ):
-                local_eval_batch = slice_and_move_batch_for_device(
-                    eval_batch, self.rank, self.world_size, self.rank
-                )
-                (policy_samples,) = self.get_batch_samples(local_eval_batch)
-
-                all_policy_samples.extend(policy_samples)
-
-            rank0_print("Policy samples:")
-            rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-            slice_and_move_batch_for_device(
-                local_eval_batch, self.rank, self.world_size, "cpu"
-            )
-
-        mean_eval_metrics = {
-            k: sum(v) / len(v) for k, v in all_eval_metrics.items()
-        }
-        rank0_print(
-            f"eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}"
-        )
-        if self.config.wandb.enabled and self.rank == 0:
-            wandb.log(mean_eval_metrics, step=self.example_counter)
 
     def _toxic_eval(self):
         """
@@ -1182,3 +1385,13 @@ class BasicTrainer(object):
             "alpha.pt",
             output_dir,
         )
+
+        if self.group_alphas:
+            self.write_state_dict(
+                self.example_counter,
+                self.alpha_groups_map,
+                None,
+                "alpha_groups.pt",
+                output_dir,
+            )
+
