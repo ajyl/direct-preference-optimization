@@ -751,6 +751,13 @@ class BasicTrainer(object):
                 1.0, (step + 1) / (self.config.warmup_steps + 1)
             ),
         )
+        self.alpha_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.alpha_optimizer,
+            lr_lambda=lambda step: min(
+                1.0, (step + 1) / (self.config.warmup_steps + 1)
+            ),
+        )
+
 
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
@@ -1073,6 +1080,7 @@ class BasicTrainer(object):
         grad_norm = self.clip_gradient()
         self.optimizer.step()
         self.scheduler.step()
+        self.alpha_scheduler.step()
         self.optimizer.zero_grad()
         self.alpha_optimizer.zero_grad()
 
