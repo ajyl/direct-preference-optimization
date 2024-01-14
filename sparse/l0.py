@@ -52,7 +52,7 @@ from dpo_utils import (
     rank0_print,
     get_local_dir,
 )
-from sparse.sparse_utils import load_probe, get_mlp_weights
+from sparse.sparse_utils import reshape_group_mask
 from dpo_constants import GPT2_PAD_IDX
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -234,146 +234,6 @@ def concatenated_inputs(
     return concatenated_batch
 
 
-def reshape_group_mask(name, z_mask, group_mask, group_grad, config):
-    """
-    Construct mask.
-    """
-    n_heads = config.n_head
-    d_model = config.n_embd
-    d_mlp = config.n_inner if config.n_inner is not None else 4 * d_model
-    vocab = config.vocab_size
-    pos = config.n_positions
-
-    if ".mlp." in name:
-        if "c_fc.weight" in name:
-            # z_mask: [d_model, d_mlp]
-            # group_mask: [d_mlp]
-            assert z_mask.shape == (d_model, d_mlp)
-            _group_mask = group_mask.unsqueeze(0).repeat((z_mask.shape[0], 1))
-            _group_grad = (
-                group_grad.unsqueeze(0).repeat((z_mask.shape[0], 1))
-                / z_mask.shape[0]
-            )
-
-        elif "c_fc.bias" in name:
-            # z_mask: [d_mlp]
-            # group_mask: [1]
-            assert z_mask.shape == (d_mlp,)
-            _group_mask = group_mask.repeat(z_mask.shape[0])
-            _group_grad = group_grad.repeat(z_mask.shape[0]) / z_mask.shape[0]
-
-        elif "c_proj.weight" in name:
-            # z_mask: [d_mlp, d_model]
-            # group_mask: [d_mlp]
-            assert z_mask.shape == (d_mlp, d_model)
-            _group_mask = group_mask.unsqueeze(-1).repeat((1, z_mask.shape[1]))
-            _group_grad = (
-                group_grad.unsqueeze(-1).repeat((1, z_mask.shape[1]))
-                / z_mask.shape[1]
-            )
-
-        elif "c_proj.bias" in name:
-            # z_mask: [d_model]
-            # group_mask: [1]
-            assert z_mask.shape == (d_model,)
-            _group_mask = group_mask.repeat(z_mask.shape[0])
-            _group_grad = group_grad.repeat(z_mask.shape[0]) / z_mask.shape[0]
-
-        else:
-            raise RuntimeError("Unexpected mask type.")
-
-    elif ".attn." in name:
-        if "c_attn.bias" in name:
-            # z_mask: [d_model * 3]
-            # group_mask: [1]
-            assert z_mask.shape == (d_model * 3,)
-            _group_mask = group_mask.repeat(z_mask.shape[0])
-            _group_grad = group_grad.repeat(z_mask.shape[0]) / z_mask.shape[0]
-
-        elif "c_attn.weight" in name:
-            # z_mask: [d_model, d_model * 3]
-            # assert z_mask.shape == (d_model, d_model * 3)
-            # w_q = torch.concat(
-            #    [
-            #        group_masks[f"{name}.q.{head_idx}"]
-            #        for head_idx in range(n_heads)
-            #    ],
-            #    dim=0,
-            # )
-            # w_k = torch.concat(
-            #    [
-            #        group_masks[f"{name}.k.{head_idx}"]
-            #        for head_idx in range(n_heads)
-            #    ],
-            #    dim=0,
-            # )
-            # w_v = torch.concat(
-            #    [
-            #        group_masks[f"{name}.v.{head_idx}"]
-            #        for head_idx in range(n_heads)
-            #    ],
-            #    dim=0,
-            # )
-            ## Should be [3 * num_heads * d_attn]
-            # _group_mask = torch.concat([w_q, w_k, w_v], dim=0)
-            # _group_mask = _group_mask.unsqueeze(0).repeat((d_model, 1))
-            # _group_grad = group_grad.unsqueeze(0).repeat((d_model, 1))
-
-            _group_mask = group_mask.unsqueeze(0).repeat(z_mask.shape)
-            _group_grad = group_grad.unsqueeze(0).repeat(z_mask.shape) / (
-                z_mask.shape[0] * z_mask.shape[1]
-            )
-
-        elif "c_proj.bias" in name:
-            # z_mask: [d_model]
-            # group_mask: [1]
-            assert z_mask.shape == (d_model,)
-            _group_mask = group_mask.repeat(z_mask.shape[0])
-            _group_grad = group_grad.repeat(z_mask.shape[0]) / z_mask.shape[0]
-
-        elif "c_proj.weight" in name:
-            # z_mask: [d_model, d_model]
-            # group_mask: [d_model]
-            assert z_mask.shape == (d_model, d_model)
-            _group_mask = group_mask.unsqueeze(-1).repeat((1, z_mask.shape[1]))
-            _group_grad = (
-                group_grad.unsqueeze(-1).repeat((1, z_mask.shape[1]))
-                / z_mask.shape[1]
-            )
-
-    elif "ln_1" in name or "ln_2" in name or "ln_f" in name:
-        # z_mask: [d_model]
-        # group_mask: [1]
-        assert z_mask.shape == (d_model,)
-        _group_mask = group_mask.repeat(z_mask.shape[0])
-        _group_grad = group_grad.repeat(z_mask.shape[0]) / z_mask.shape[0]
-
-    elif "wte" in name:
-        # z_mask: [vocab, d_model]
-        # group_mask: [vocab]
-        assert z_mask.shape == (vocab, d_model)
-        _group_mask = group_mask.unsqueeze(-1).repeat((1, z_mask.shape[1]))
-        _group_grad = (
-            group_grad.unsqueeze(-1).repeat((1, z_mask.shape[1]))
-            / z_mask.shape[1]
-        )
-
-    elif "wpe" in name:
-        # z_mask: [pos, d_model]
-        # group_mask: [pos]
-        assert z_mask.shape == (pos, d_model)
-        _group_mask = group_mask.unsqueeze(-1).repeat((1, z_mask.shape[1]))
-        _group_grad = (
-            group_grad.unsqueeze(-1).repeat((1, z_mask.shape[1]))
-            / z_mask.shape[1]
-        )
-
-    if z_mask.shape != _group_mask.shape:
-        breakpoint()
-    # TODO: _group_mask device should be set elsewhere?
-    return _group_mask, _group_grad
-
-
 class BasicTrainer(object):
     def __init__(
         self,
@@ -551,25 +411,25 @@ class BasicTrainer(object):
                     _add_alpha(name, 1)
 
                 elif "c_attn.weight" in name:
-                    # num_heads = self.model.config.n_head
+                    num_heads = self.model.config.n_head
                     ## [d_model, d_model * 3] -> [d_model, 3 * num_heads * d_attn]
-                    # w_q, w_k, w_v = torch.tensor_split(param, 3, dim=1)
+                    w_q, w_k, w_v = torch.tensor_split(param, 3, dim=1)
 
                     ## [heads, d_model, d_attn]
-                    # w_q = einops.rearrange(
-                    #    w_q, "m (i h) -> i m h", i=num_heads
-                    # )
-                    # w_k = einops.rearrange(
-                    #    w_k, "m (i h) -> i m h", i=num_heads
-                    # )
-                    # w_v = einops.rearrange(
-                    #    w_v, "m (i h) -> i m h", i=num_heads
-                    # )
-                    # for head_idx in range(num_heads):
-                    #    _add_alpha(f"{name}.q.{head_idx}", w_q.shape[2])
-                    #    _add_alpha(f"{name}.k.{head_idx}", w_q.shape[2])
-                    #    _add_alpha(f"{name}.v.{head_idx}", w_q.shape[2])
-                    _add_alpha(name, 1)
+                    w_q = einops.rearrange(
+                        w_q, "m (i h) -> i m h", i=num_heads
+                    )
+                    w_k = einops.rearrange(
+                        w_k, "m (i h) -> i m h", i=num_heads
+                    )
+                    w_v = einops.rearrange(
+                        w_v, "m (i h) -> i m h", i=num_heads
+                    )
+                    for head_idx in range(num_heads):
+                        _add_alpha(f"{name}.q.{head_idx}", w_q.shape[2])
+                        _add_alpha(f"{name}.k.{head_idx}", w_q.shape[2])
+                        _add_alpha(f"{name}.v.{head_idx}", w_q.shape[2])
+                    # _add_alpha(name, 1)
 
                 elif "c_proj.bias" in name:
                     # [d_model]
@@ -633,85 +493,96 @@ class BasicTrainer(object):
                     )
 
             if self.group_alphas:
-                alpha_group = self.alpha_groups_map[name]
-                alpha_group.grad = torch.zeros_like(alpha_group.data)
-                _grouped_z, _grouped_z_grad = concrete_stretched(
-                    alpha_group, self.concrete_lower, self.concrete_upper
-                )
-                if l0_pen == 0:
-                    l0_pen += torch.sigmoid(alpha_group - self.log_ratio).sum()
-                else:
-                    l0_pen += (
-                        torch.sigmoid(alpha_group - self.log_ratio)
-                        .sum()
-                        .to(l0_pen.device)
+                # alpha_group = self.alpha_groups_map[name]
+                # alpha_group.grad = torch.zeros_like(alpha_group.data)
+                # _grouped_z, _grouped_z_grad = concrete_stretched(
+                #    alpha_group, self.concrete_lower, self.concrete_upper
+                # )
+                # if l0_pen == 0:
+                #    l0_pen += torch.sigmoid(alpha_group - self.log_ratio).sum()
+                # else:
+                #    l0_pen += (
+                #        torch.sigmoid(alpha_group - self.log_ratio)
+                #        .sum()
+                #        .to(l0_pen.device)
+                #    )
+
+                if name.endswith("attn.c_attn.weight"):
+
+                    for i in range(self.model.config.n_head):
+                        self.alpha_groups_map[
+                            f"{name}.q.{i}"
+                        ].grad = torch.zeros_like(
+                            self.alpha_groups_map[f"{name}.q.{i}"]
+                        )
+                        self.alpha_groups_map[
+                            f"{name}.k.{i}"
+                        ].grad = torch.zeros_like(
+                            self.alpha_groups_map[f"{name}.k.{i}"]
+                        )
+                        self.alpha_groups_map[
+                            f"{name}.v.{i}"
+                        ].grad = torch.zeros_like(
+                            self.alpha_groups_map[f"{name}.v.{i}"]
+                        )
+
+                    w_q = torch.concat(
+                        [
+                            self.alpha_groups_map[f"{name}.q.{head_idx}"]
+                            for head_idx in range(self.model.config.n_head)
+                        ],
+                        dim=0,
+                    )
+                    w_k = torch.concat(
+                        [
+                            self.alpha_groups_map[f"{name}.k.{head_idx}"]
+                            for head_idx in range(self.model.config.n_head)
+                        ],
+                        dim=0,
+                    )
+                    w_v = torch.concat(
+                        [
+                            self.alpha_groups_map[f"{name}.v.{head_idx}"]
+                            for head_idx in range(self.model.config.n_head)
+                        ],
+                        dim=0,
                     )
 
-                # if name.endswith("attn.c_attn.weight"):
+                    alpha_group = torch.concat([w_q, w_k, w_v], dim=0)
+                    alpha_group.grad = torch.zeros_like(alpha_group.data)
+                    _grouped_z, _grouped_z_grad = concrete_stretched(
+                        alpha_group,
+                        self.concrete_lower,
+                        self.concrete_upper,
+                    )
 
-                #    for i in range(self.model.config.n_head):
-                #        self.alpha_groups_map[
-                #            f"{name}.q.{i}"
-                #        ].grad = torch.zeros_like(
-                #            self.alpha_groups_map[f"{name}.q.{i}"]
-                #        )
-                #        self.alpha_groups_map[
-                #            f"{name}.k.{i}"
-                #        ].grad = torch.zeros_like(
-                #            self.alpha_groups_map[f"{name}.k.{i}"]
-                #        )
-                #        self.alpha_groups_map[
-                #            f"{name}.v.{i}"
-                #        ].grad = torch.zeros_like(
-                #            self.alpha_groups_map[f"{name}.v.{i}"]
-                #        )
+                    if l0_pen == 0:
+                        l0_pen += torch.sigmoid(
+                            alpha_group - self.log_ratio
+                        ).sum()
+                    else:
+                        l0_pen += (
+                            torch.sigmoid(alpha_group - self.log_ratio)
+                            .sum()
+                            .to(l0_pen.device)
+                        )
 
-                #    w_q = torch.concat(
-                #        [
-                #            self.alpha_groups_map[f"{name}.q.{head_idx}"]
-                #            for head_idx in range(self.model.config.n_head)
-                #        ],
-                #        dim=0,
-                #    )
-                #    w_k = torch.concat(
-                #        [
-                #            self.alpha_groups_map[f"{name}.k.{head_idx}"]
-                #            for head_idx in range(self.model.config.n_head)
-                #        ],
-                #        dim=0,
-                #    )
-                #    w_v = torch.concat(
-                #        [
-                #            self.alpha_groups_map[f"{name}.v.{head_idx}"]
-                #            for head_idx in range(self.model.config.n_head)
-                #        ],
-                #        dim=0,
-                #    )
-
-                #    alpha_group = torch.concat([w_q, w_k, w_v], dim=0)
-                #    alpha_group.grad = torch.zeros_like(alpha_group.data)
-                #    _grouped_z, _grouped_z_grad = concrete_stretched(
-                #        alpha_group,
-                #        self.concrete_lower,
-                #        self.concrete_upper,
-                #    )
-                #    l0_pen += (
-                #        torch.sigmoid(alpha_group - self.log_ratio)
-                #        .sum()
-                #        .to(l0_pen.device)
-                #    )
-
-                # else:
-                #    alpha_group = self.alpha_groups_map[name]
-                #    alpha_group.grad = torch.zeros_like(alpha_group.data)
-                #    _grouped_z, _grouped_z_grad = concrete_stretched(
-                #        alpha_group, self.concrete_lower, self.concrete_upper
-                #    )
-                #    l0_pen += (
-                #        torch.sigmoid(alpha_group - self.log_ratio)
-                #        .sum()
-                #        .to(l0_pen.device)
-                #    )
+                else:
+                    alpha_group = self.alpha_groups_map[name]
+                    alpha_group.grad = torch.zeros_like(alpha_group.data)
+                    _grouped_z, _grouped_z_grad = concrete_stretched(
+                        alpha_group, self.concrete_lower, self.concrete_upper
+                    )
+                    if l0_pen == 0:
+                        l0_pen += torch.sigmoid(
+                            alpha_group - self.log_ratio
+                        ).sum()
+                    else:
+                        l0_pen += (
+                            torch.sigmoid(alpha_group - self.log_ratio)
+                            .sum()
+                            .to(l0_pen.device)
+                        )
 
             mask = _z
             if self.group_alphas:
@@ -785,109 +656,107 @@ class BasicTrainer(object):
                     param.grad.data * diff_param * z_mask * z_grad
                 )
             if self.group_alphas:
-                self.alpha_groups_map[name].grad.copy_(
-                    (
-                        param.grad.data
-                        * diff_param.data
-                        * group_z_mask.to(param.device)
-                        * group_z_grad.to(param.device)
-                    ).sum()
-                )
+                # self.alpha_groups_map[name].grad.copy_(
+                #    (
+                #        param.grad.data
+                #        * diff_param.data
+                #        * group_z_mask.to(param.device)
+                #        * group_z_grad.to(param.device)
+                #    ).sum()
+                # )
 
-                # if "c_attn.weight" in name:
-                #    num_heads = self.model.config.n_head
-                #    # TODO
-                #    d_model = 1024
-                #    q_param, k_param, v_param = torch.tensor_split(
-                #        param.grad.data, 3, dim=1
-                #    )
-                #    q_diff, k_diff, v_diff = torch.tensor_split(
-                #        diff_param, 3, dim=1
-                #    )
-                #    q_mask, k_mask, v_mask = torch.tensor_split(
-                #        group_z_mask, 3, dim=1
-                #    )
-                #    q_z_grad, k_z_grad, v_z_grad = torch.tensor_split(
-                #        group_z_grad, 3, dim=1
-                #    )
+                if "c_attn.weight" in name:
+                    num_heads = self.model.config.n_head
+                    q_param, k_param, v_param = torch.tensor_split(
+                        param.grad.data, 3, dim=1
+                    )
+                    q_diff, k_diff, v_diff = torch.tensor_split(
+                        diff_param, 3, dim=1
+                    )
+                    q_mask, k_mask, v_mask = torch.tensor_split(
+                        group_z_mask, 3, dim=1
+                    )
+                    q_z_grad, k_z_grad, v_z_grad = torch.tensor_split(
+                        group_z_grad, 3, dim=1
+                    )
 
-                #    q_param = einops.rearrange(
-                #        q_param, "m (i h) -> i m h", i=num_heads
-                #    )
-                #    k_param = einops.rearrange(
-                #        k_param, "m (i h) -> i m h", i=num_heads
-                #    )
-                #    v_param = einops.rearrange(
-                #        v_param, "m (i h) -> i m h", i=num_heads
-                #    )
+                    q_param = einops.rearrange(
+                        q_param, "m (i h) -> i m h", i=num_heads
+                    )
+                    k_param = einops.rearrange(
+                        k_param, "m (i h) -> i m h", i=num_heads
+                    )
+                    v_param = einops.rearrange(
+                        v_param, "m (i h) -> i m h", i=num_heads
+                    )
 
-                #    q_diff = einops.rearrange(
-                #        q_diff, "m (i h) -> i m h", i=num_heads
-                #    )
-                #    k_diff = einops.rearrange(
-                #        k_diff, "m (i h) -> i m h", i=num_heads
-                #    )
-                #    v_diff = einops.rearrange(
-                #        v_diff, "m (i h) -> i m h", i=num_heads
-                #    )
+                    q_diff = einops.rearrange(
+                        q_diff, "m (i h) -> i m h", i=num_heads
+                    )
+                    k_diff = einops.rearrange(
+                        k_diff, "m (i h) -> i m h", i=num_heads
+                    )
+                    v_diff = einops.rearrange(
+                        v_diff, "m (i h) -> i m h", i=num_heads
+                    )
 
-                #    q_mask = einops.rearrange(
-                #        q_mask, "m (i h) -> i m h", i=num_heads
-                #    )
-                #    k_mask = einops.rearrange(
-                #        k_mask, "m (i h) -> i m h", i=num_heads
-                #    )
-                #    v_mask = einops.rearrange(
-                #        v_mask, "m (i h) -> i m h", i=num_heads
-                #    )
+                    q_mask = einops.rearrange(
+                        q_mask, "m (i h) -> i m h", i=num_heads
+                    )
+                    k_mask = einops.rearrange(
+                        k_mask, "m (i h) -> i m h", i=num_heads
+                    )
+                    v_mask = einops.rearrange(
+                        v_mask, "m (i h) -> i m h", i=num_heads
+                    )
 
-                #    q_z_grad = einops.rearrange(
-                #        q_z_grad, "m (i h) -> i m h", i=num_heads
-                #    )
-                #    k_z_grad = einops.rearrange(
-                #        k_z_grad, "m (i h) -> i m h", i=num_heads
-                #    )
-                #    v_z_grad = einops.rearrange(
-                #        v_z_grad, "m (i h) -> i m h", i=num_heads
-                #    )
+                    q_z_grad = einops.rearrange(
+                        q_z_grad, "m (i h) -> i m h", i=num_heads
+                    )
+                    k_z_grad = einops.rearrange(
+                        k_z_grad, "m (i h) -> i m h", i=num_heads
+                    )
+                    v_z_grad = einops.rearrange(
+                        v_z_grad, "m (i h) -> i m h", i=num_heads
+                    )
 
-                #    for i in range(num_heads):
-                #        self.alpha_groups_map[f"{name}.q.{i}"].grad.copy_(
-                #            (
-                #                q_param[i]
-                #                * q_diff[i]
-                #                * q_mask[i].to(q_param.device)
-                #                * q_z_grad[i].to(q_param.device)
-                #            ).sum()
-                #        )
+                    for i in range(num_heads):
+                        self.alpha_groups_map[f"{name}.q.{i}"].grad.copy_(
+                            (
+                                q_param[i]
+                                * q_diff[i]
+                                * q_mask[i].to(q_param.device)
+                                * q_z_grad[i].to(q_param.device)
+                            ).sum()
+                        )
 
-                #        self.alpha_groups_map[f"{name}.k.{i}"].grad.copy_(
-                #            (
-                #                k_param[i]
-                #                * k_diff[i]
-                #                * k_mask[i].to(k_param.device)
-                #                * k_z_grad[i].to(k_param.device)
-                #            ).sum()
-                #        )
+                        self.alpha_groups_map[f"{name}.k.{i}"].grad.copy_(
+                            (
+                                k_param[i]
+                                * k_diff[i]
+                                * k_mask[i].to(k_param.device)
+                                * k_z_grad[i].to(k_param.device)
+                            ).sum()
+                        )
 
-                #        self.alpha_groups_map[f"{name}.v.{i}"].grad.copy_(
-                #            (
-                #                v_param[i]
-                #                * v_diff[i]
-                #                * v_mask[i].to(v_param.device)
-                #                * v_z_grad[i].to(v_param.device)
-                #            ).sum()
-                #        )
+                        self.alpha_groups_map[f"{name}.v.{i}"].grad.copy_(
+                            (
+                                v_param[i]
+                                * v_diff[i]
+                                * v_mask[i].to(v_param.device)
+                                * v_z_grad[i].to(v_param.device)
+                            ).sum()
+                        )
 
-                # else:
-                #    self.alpha_groups_map[name].grad.copy_(
-                #        (
-                #            param.grad.data
-                #            * diff_param
-                #            * group_z_mask.to(param.device)
-                #            * group_z_grad.to(param.device)
-                #        ).sum()
-                #    )
+                else:
+                    self.alpha_groups_map[name].grad.copy_(
+                        (
+                            param.grad.data
+                            * diff_param
+                            * group_z_mask.to(param.device)
+                            * group_z_grad.to(param.device)
+                        ).sum()
+                    )
 
     def get_batch_samples(
         self, batch: Dict[str, torch.LongTensor]
