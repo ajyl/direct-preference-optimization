@@ -645,112 +645,112 @@ class BasicTrainer(object):
             self.diff_params_map[name].grad.copy_(
                 param.grad.data * mask.to(param.device)
             )
-            if self.indiv_alphas:
-                self.alpha_params_map[name].grad.copy_(
-                    param.grad.data * diff_param * z_mask * z_grad
-                )
-            if self.group_alphas:
-                # self.alpha_groups_map[name].grad.copy_(
-                #    (
-                #        param.grad.data
-                #        * diff_param.data
-                #        * group_z_mask.to(param.device)
-                #        * group_z_grad.to(param.device)
-                #    ).sum()
-                # )
+            #if self.indiv_alphas:
+            #    self.alpha_params_map[name].grad.copy_(
+            #        param.grad.data * diff_param * z_mask * z_grad
+            #    )
+            #if self.group_alphas:
+            #    # self.alpha_groups_map[name].grad.copy_(
+            #    #    (
+            #    #        param.grad.data
+            #    #        * diff_param.data
+            #    #        * group_z_mask.to(param.device)
+            #    #        * group_z_grad.to(param.device)
+            #    #    ).sum()
+            #    # )
 
-                if "c_attn.weight" in name:
-                    num_heads = self.model.config.n_head
-                    q_param, k_param, v_param = torch.tensor_split(
-                        param.grad.data, 3, dim=1
-                    )
-                    q_diff, k_diff, v_diff = torch.tensor_split(
-                        diff_param, 3, dim=1
-                    )
-                    q_mask, k_mask, v_mask = torch.tensor_split(
-                        group_z_mask, 3, dim=1
-                    )
-                    q_z_grad, k_z_grad, v_z_grad = torch.tensor_split(
-                        group_z_grad, 3, dim=1
-                    )
+            #    if "c_attn.weight" in name:
+            #        num_heads = self.model.config.n_head
+            #        q_param, k_param, v_param = torch.tensor_split(
+            #            param.grad.data, 3, dim=1
+            #        )
+            #        q_diff, k_diff, v_diff = torch.tensor_split(
+            #            diff_param, 3, dim=1
+            #        )
+            #        q_mask, k_mask, v_mask = torch.tensor_split(
+            #            group_z_mask, 3, dim=1
+            #        )
+            #        q_z_grad, k_z_grad, v_z_grad = torch.tensor_split(
+            #            group_z_grad, 3, dim=1
+            #        )
 
-                    q_param = einops.rearrange(
-                        q_param, "m (i h) -> i m h", i=num_heads
-                    )
-                    k_param = einops.rearrange(
-                        k_param, "m (i h) -> i m h", i=num_heads
-                    )
-                    v_param = einops.rearrange(
-                        v_param, "m (i h) -> i m h", i=num_heads
-                    )
+            #        q_param = einops.rearrange(
+            #            q_param, "m (i h) -> i m h", i=num_heads
+            #        )
+            #        k_param = einops.rearrange(
+            #            k_param, "m (i h) -> i m h", i=num_heads
+            #        )
+            #        v_param = einops.rearrange(
+            #            v_param, "m (i h) -> i m h", i=num_heads
+            #        )
 
-                    q_diff = einops.rearrange(
-                        q_diff, "m (i h) -> i m h", i=num_heads
-                    )
-                    k_diff = einops.rearrange(
-                        k_diff, "m (i h) -> i m h", i=num_heads
-                    )
-                    v_diff = einops.rearrange(
-                        v_diff, "m (i h) -> i m h", i=num_heads
-                    )
+            #        q_diff = einops.rearrange(
+            #            q_diff, "m (i h) -> i m h", i=num_heads
+            #        )
+            #        k_diff = einops.rearrange(
+            #            k_diff, "m (i h) -> i m h", i=num_heads
+            #        )
+            #        v_diff = einops.rearrange(
+            #            v_diff, "m (i h) -> i m h", i=num_heads
+            #        )
 
-                    q_mask = einops.rearrange(
-                        q_mask, "m (i h) -> i m h", i=num_heads
-                    )
-                    k_mask = einops.rearrange(
-                        k_mask, "m (i h) -> i m h", i=num_heads
-                    )
-                    v_mask = einops.rearrange(
-                        v_mask, "m (i h) -> i m h", i=num_heads
-                    )
+            #        q_mask = einops.rearrange(
+            #            q_mask, "m (i h) -> i m h", i=num_heads
+            #        )
+            #        k_mask = einops.rearrange(
+            #            k_mask, "m (i h) -> i m h", i=num_heads
+            #        )
+            #        v_mask = einops.rearrange(
+            #            v_mask, "m (i h) -> i m h", i=num_heads
+            #        )
 
-                    q_z_grad = einops.rearrange(
-                        q_z_grad, "m (i h) -> i m h", i=num_heads
-                    )
-                    k_z_grad = einops.rearrange(
-                        k_z_grad, "m (i h) -> i m h", i=num_heads
-                    )
-                    v_z_grad = einops.rearrange(
-                        v_z_grad, "m (i h) -> i m h", i=num_heads
-                    )
+            #        q_z_grad = einops.rearrange(
+            #            q_z_grad, "m (i h) -> i m h", i=num_heads
+            #        )
+            #        k_z_grad = einops.rearrange(
+            #            k_z_grad, "m (i h) -> i m h", i=num_heads
+            #        )
+            #        v_z_grad = einops.rearrange(
+            #            v_z_grad, "m (i h) -> i m h", i=num_heads
+            #        )
 
-                    for i in range(num_heads):
-                        self.alpha_groups_map[f"{name}.q.{i}"].grad.copy_(
-                            (
-                                q_param[i]
-                                * q_diff[i]
-                                * q_mask[i].to(q_param.device)
-                                * q_z_grad[i].to(q_param.device)
-                            ).sum()
-                        )
+            #        for i in range(num_heads):
+            #            self.alpha_groups_map[f"{name}.q.{i}"].grad.copy_(
+            #                (
+            #                    q_param[i]
+            #                    * q_diff[i]
+            #                    * q_mask[i].to(q_param.device)
+            #                    * q_z_grad[i].to(q_param.device)
+            #                ).sum()
+            #            )
 
-                        self.alpha_groups_map[f"{name}.k.{i}"].grad.copy_(
-                            (
-                                k_param[i]
-                                * k_diff[i]
-                                * k_mask[i].to(k_param.device)
-                                * k_z_grad[i].to(k_param.device)
-                            ).sum()
-                        )
+            #            self.alpha_groups_map[f"{name}.k.{i}"].grad.copy_(
+            #                (
+            #                    k_param[i]
+            #                    * k_diff[i]
+            #                    * k_mask[i].to(k_param.device)
+            #                    * k_z_grad[i].to(k_param.device)
+            #                ).sum()
+            #            )
 
-                        self.alpha_groups_map[f"{name}.v.{i}"].grad.copy_(
-                            (
-                                v_param[i]
-                                * v_diff[i]
-                                * v_mask[i].to(v_param.device)
-                                * v_z_grad[i].to(v_param.device)
-                            ).sum()
-                        )
+            #            self.alpha_groups_map[f"{name}.v.{i}"].grad.copy_(
+            #                (
+            #                    v_param[i]
+            #                    * v_diff[i]
+            #                    * v_mask[i].to(v_param.device)
+            #                    * v_z_grad[i].to(v_param.device)
+            #                ).sum()
+            #            )
 
-                else:
-                    self.alpha_groups_map[name].grad.copy_(
-                        (
-                            param.grad.data
-                            * diff_param
-                            * group_z_mask.to(param.device)
-                            * group_z_grad.to(param.device)
-                        ).sum()
-                    )
+            #    else:
+            #        self.alpha_groups_map[name].grad.copy_(
+            #            (
+            #                param.grad.data
+            #                * diff_param
+            #                * group_z_mask.to(param.device)
+            #                * group_z_grad.to(param.device)
+            #            ).sum()
+            #        )
 
     def get_batch_samples(
         self, batch: Dict[str, torch.LongTensor]
