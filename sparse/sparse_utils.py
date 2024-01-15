@@ -152,7 +152,21 @@ def reshape_group_mask(name, z_mask, group_mask, group_grad, config):
             / z_mask.shape[1]
         )
 
-    if z_mask.shape != _group_mask.shape:
-        breakpoint()
+    #if z_mask.shape != _group_mask.shape:
+    #    breakpoint()
     # TODO: _group_mask device should be set elsewhere?
     return _group_mask, _group_grad
+
+
+def concrete_stretched(alpha, l=-0.1, r=1.1):
+    _u = torch.zeros_like(alpha).uniform_().clamp_(0.0001, 0.9999)
+    _s = (torch.sigmoid(_u.log() - (1 - _u).log() + alpha)).detach()
+    _s_bar = _s * (r - l) + l
+    _t = _s_bar.clamp(0, 1000)
+    _z = _t.clamp(-1000, 1)
+    dz_dt = (_t < 1).float().to(alpha.device).detach()
+    dt_du = (_s_bar > 0).float().to(alpha.device).detach()
+    du_ds = r - l
+    ds_dalpha = (_s * (1 - _s)).detach()
+    dz_dalpha = dz_dt * dt_du * du_ds * ds_dalpha
+    return _z.detach(), dz_dalpha.detach()

@@ -43,6 +43,7 @@ from sparse.toxicity_dataset import (
     get_toxic_prompts_batch_iterator,
     get_toxic_token_ids,
 )
+from sparse.eval import eval_perplexity
 from dpo_utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -52,24 +53,10 @@ from dpo_utils import (
     rank0_print,
     get_local_dir,
 )
-from sparse.sparse_utils import reshape_group_mask
+from sparse.sparse_utils import reshape_group_mask, concrete_stretched
 from dpo_constants import GPT2_PAD_IDX
 
 torch.backends.cuda.matmul.allow_tf32 = True
-
-
-def concrete_stretched(alpha, l=-0.1, r=1.1):
-    _u = torch.zeros_like(alpha).uniform_().clamp_(0.0001, 0.9999)
-    _s = (torch.sigmoid(_u.log() - (1 - _u).log() + alpha)).detach()
-    _s_bar = _s * (r - l) + l
-    _t = _s_bar.clamp(0, 1000)
-    _z = _t.clamp(-1000, 1)
-    dz_dt = (_t < 1).float().to(alpha.device).detach()
-    dt_du = (_s_bar > 0).float().to(alpha.device).detach()
-    du_ds = r - l
-    ds_dalpha = (_s * (1 - _s)).detach()
-    dz_dalpha = dz_dt * dt_du * du_ds * ds_dalpha
-    return _z.detach(), dz_dalpha.detach()
 
 
 def generate(
@@ -312,14 +299,12 @@ class BasicTrainer(object):
             self.toxic_data_batches = list(self.toxic_data_iterator)
             self.toxic_tokens = get_toxic_token_ids(self.tokenizer)
 
+        self.alpha_optimizer = None
+        self.alpha_scheduler = None
+
         self.sparse_alpha = config.sparse_alpha
         self.indiv_alphas = config.indiv_alphas
         self.group_alphas = config.group_alphas
-
-        if self.indiv_alphas is False and self.group_alphas is False:
-            raise ValueError(
-                "Both indiv_alphas and group_alphas can't be false."
-            )
 
         self.diff_params = []
         self.diff_params_map = {}
@@ -329,6 +314,9 @@ class BasicTrainer(object):
         self.alpha_groups_map = {}
 
         self.init_diff()
+
+        if self.indiv_alphas is False and self.group_alphas is False:
+            self.sparse_alpha = 0
 
         if self.indiv_alphas:
             self.init_indiv_mask()
@@ -604,7 +592,11 @@ class BasicTrainer(object):
             mask = mask.to(diff.device)
 
             ref_weight = self.orig[name]
-            param.data.copy_(ref_weight.to(diff.device) + mask * diff.data)
+
+            if self.indiv_alphas or self.group_alphas:
+                param.data.copy_(ref_weight.to(diff.device) + mask * diff.data)
+            else:
+                param.data.copy_(ref_weight.to(diff.device) + diff.data)
 
             nonzero_z += (_z > 0).detach().sum().float().item()
             nonzero_params += (mask > 0).detach().sum().float().item()
@@ -636,7 +628,7 @@ class BasicTrainer(object):
         """
         for name, param in self.model.named_parameters():
             if param.grad is None:
-                continue
+                breakpoint()
 
             diff_param = grad_params[name]["dense_params"]
             z_mask = grad_params[name]["z"]
@@ -650,7 +642,9 @@ class BasicTrainer(object):
             if self.indiv_alphas and self.group_alphas:
                 mask = z_mask * group_z_mask.to(z_mask.device)
 
-            self.diff_params_map[name].grad.copy_(param.grad.data * mask)
+            self.diff_params_map[name].grad.copy_(
+                param.grad.data * mask.to(param.device)
+            )
             if self.indiv_alphas:
                 self.alpha_params_map[name].grad.copy_(
                     param.grad.data * diff_param * z_mask * z_grad
@@ -912,18 +906,19 @@ class BasicTrainer(object):
             all_devices_losses.cpu().numpy().tolist()
         )
 
-        metrics[f"sparsity/l0_penalty_{train_test}"] = [
-            grad_params["l0"].detach().item()
-        ]
-        metrics[f"sparsity/nonzero_params_{train_test}"] = [
-            grad_params["nonzero_params"]
-        ]
-        metrics[f"sparsity/nonzero_z_{train_test}"] = [
-            grad_params["nonzero_z"]
-        ]
-        metrics[f"sparsity/nonzero_groups_{train_test}"] = [
-            grad_params["nonzero_groups"]
-        ]
+        if self.group_alphas or self.indiv_alphas:
+            metrics[f"sparsity/l0_penalty_{train_test}"] = [
+                grad_params["l0"].detach().item()
+            ]
+            metrics[f"sparsity/nonzero_params_{train_test}"] = [
+                grad_params["nonzero_params"]
+            ]
+            metrics[f"sparsity/nonzero_z_{train_test}"] = [
+                grad_params["nonzero_z"]
+            ]
+            metrics[f"sparsity/nonzero_groups_{train_test}"] = [
+                grad_params["nonzero_groups"]
+            ]
         return losses.mean(), grad_params, metrics
 
     def train_loop(self):
@@ -932,27 +927,34 @@ class BasicTrainer(object):
         rank0_print(f"Using {self.config.optimizer} optimizer")
 
         self.optimizer = getattr(torch.optim, self.config.optimizer)(
-            self.diff_params,
-            lr=self.config.lr,
+            [
+                {"params": self.diff_params, "lr": self.config.lr},
+                {
+                    "params": self.alpha_params + self.alpha_groups,
+                    "lr": self.config.sparse_lr,
+                },
+            ]
         )
 
-        self.alpha_optimizer = getattr(torch.optim, self.config.optimizer)(
-            self.alpha_params + self.alpha_groups,
-            lr=self.config.sparse_lr,
-        )
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
             lr_lambda=lambda step: min(
                 1.0, (step + 1) / (self.config.warmup_steps + 1)
             ),
         )
-        self.alpha_scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.alpha_optimizer,
-            lr_lambda=lambda step: min(
-                1.0, (step + 1) / (self.config.warmup_steps + 1)
-            ),
-        )
-        #
+
+        # if len(self.alpha_params + self.alpha_groups) > 0:
+        #    self.alpha_optimizer = getattr(torch.optim, self.config.optimizer)(
+        #        self.alpha_params + self.alpha_groups,
+        #        lr=self.config.sparse_lr,
+        #    )
+        #    self.alpha_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        #        self.alpha_optimizer,
+        #        lr_lambda=lambda step: min(
+        #            1.0, (step + 1) / (self.config.warmup_steps + 1)
+        #        ),
+        #    )
+
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -963,9 +965,11 @@ class BasicTrainer(object):
             ):
                 result = self.eval()
                 if result == -1:
-                    return
+                    break
 
             self.train(batch)
+
+        self.eval_ppl()
 
     def train(self, batch):
         """
@@ -993,14 +997,20 @@ class BasicTrainer(object):
             loss, sparse_grad_params, metrics = self.get_batch_metrics(
                 local_microbatch, self.config.loss, train=True
             )
-            (loss / self.config.gradient_accumulation_steps).backward()
+            # (loss / self.config.gradient_accumulation_steps).backward()
+            (
+                (loss + self.sparse_alpha * sparse_grad_params["l0"])
+                / self.config.gradient_accumulation_steps
+            ).backward()
 
             for k, v in metrics.items():
                 batch_metrics[k].extend(v)
 
         self.set_grads(sparse_grad_params["grad_params"])
-        l0_loss = self.sparse_alpha * sparse_grad_params["l0"]
-        l0_loss.backward()
+
+        # if self.indiv_alphas or self.group_alphas:
+        #    l0_loss = self.sparse_alpha * sparse_grad_params["l0"]
+        #    l0_loss.backward()
 
         if self.indiv_alphas:
             alpha_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1016,12 +1026,15 @@ class BasicTrainer(object):
             self.config.max_grad_norm,
         ).item()
 
-        self.alpha_optimizer.step()
+        if self.alpha_optimizer is not None:
+            self.alpha_optimizer.step()
+            self.alpha_optimizer.zero_grad()
+        if self.alpha_scheduler is not None:
+            self.alpha_scheduler.step()
+
         self.optimizer.step()
         self.scheduler.step()
-        self.alpha_scheduler.step()
         self.optimizer.zero_grad()
-        self.alpha_optimizer.zero_grad()
 
         step_time = time.time() - start_time
         examples_per_second = self.config.batch_size / step_time
@@ -1179,6 +1192,47 @@ class BasicTrainer(object):
                 return -1
 
         return 0
+
+    def eval_ppl(self):
+        """
+        Run PPL
+        """
+        try:
+            ckpt_dir = os.path.join(self.run_dir, "checkpoints")
+            diff_file = os.path.join(ckpt_dir, "diffs.pt")
+            diff_state_dict = torch.load(diff_file)["state"]
+
+            if self.indiv_alphas:
+                alphas = torch.load(os.path.join(ckpt_dir, "alpha.pt"))["state"]
+            if self.group_alphas:
+                alpha_groups = torch.load(
+                    os.path.join(ckpt_dir, "alpha_groups.pt")
+                )["state"]
+        except:
+            breakpoint()
+
+        try:
+            for name, param in self.model.named_parameters():
+                mask = torch.ones((1))
+                if self.indiv_alphas:
+                    _alpha = alphas[name]
+                    mask = concrete_stretched(
+                        _alpha, self.concrete_lower, self.concrete_upper
+                    )
+                param.data.copy_(
+                    self.orig[name]
+                    + mask.to(param.device)
+                    * diff_state_dict[name].to(param.device)
+                )
+        except:
+            breakpoint()
+
+        try:
+            self.model.eval()
+            ppl = eval_perplexity(self.model, self.tokenizer)
+            print(f"Perplexity: {ppl.item()}")
+        except:
+            breakpoint()
 
     def _toxic_eval(self):
         """
