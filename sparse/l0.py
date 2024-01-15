@@ -860,6 +860,12 @@ class BasicTrainer(object):
             losses.detach().cpu().numpy().tolist()
         )
 
+        if self.indiv_alphas:
+            losses = losses + self.sparse_alpha * grad_params["l0"]
+            metrics[f"summed_loss_{train_test}"] = (
+                losses.detach().cpu().numpy().tolist()
+            )
+
         reward_accuracies = (pos_rewards > neg_rewards).float()
 
         pos_rewards = all_gather_if_needed(
@@ -998,10 +1004,8 @@ class BasicTrainer(object):
                 local_microbatch, self.config.loss, train=True
             )
             # (loss / self.config.gradient_accumulation_steps).backward()
-            (
-                (loss + self.sparse_alpha * sparse_grad_params["l0"])
-                / self.config.gradient_accumulation_steps
-            ).backward()
+
+            (loss / self.config.gradient_accumulation_steps).backward()
 
             for k, v in metrics.items():
                 batch_metrics[k].extend(v)
@@ -1203,7 +1207,9 @@ class BasicTrainer(object):
             diff_state_dict = torch.load(diff_file)["state"]
 
             if self.indiv_alphas:
-                alphas = torch.load(os.path.join(ckpt_dir, "alpha.pt"))["state"]
+                alphas = torch.load(os.path.join(ckpt_dir, "alpha.pt"))[
+                    "state"
+                ]
             if self.group_alphas:
                 alpha_groups = torch.load(
                     os.path.join(ckpt_dir, "alpha_groups.pt")
@@ -1220,7 +1226,7 @@ class BasicTrainer(object):
                         _alpha, self.concrete_lower, self.concrete_upper
                     )
                 param.data.copy_(
-                    self.orig[name]
+                    self.orig[name].to(param.device)
                     + mask.to(param.device)
                     * diff_state_dict[name].to(param.device)
                 )
